@@ -137,6 +137,8 @@ class StatusFileReporter:
             "removed": 0,
             "symbols": 0,
             "semantic": None,
+            "semantic_failures": 0,
+            "semantic_embed_failures": 0,
             "pid": os.getpid(),
             "started_at": self._started,
             "updated_at": self._started,
@@ -181,6 +183,8 @@ class StatusFileReporter:
             removed=getattr(report, "removed", 0),
             symbols=getattr(report, "symbols", 0),
             semantic=getattr(report, "semantic_enabled", None),
+            semantic_failures=getattr(report, "semantic_failures", 0),
+            semantic_embed_failures=getattr(report, "semantic_embed_failures", 0),
             finished_at=time.time(),
         )
         self._flush(force=True)

@@ -85,6 +85,25 @@ def _get_semantic(service: Optional[str] = None) -> SemanticIndex | None:
         return _semantics[k]
 
 
+def _semantic_status(service: Optional[str]) -> tuple[Optional[SemanticIndex], str]:
+    """Resolve the semantic layer AND a human/agent-facing reason for its state.
+
+    Returns (index_or_None, reason) where reason is one of:
+      "ok"          - usable
+      "disabled"    - turned off via CODE_INDEX_SEMANTIC=0 for this service
+      "unavailable" - enabled but the embedder/Qdrant could not be reached
+    This lets the search tools tell the agent "semantic is down" (degraded)
+    instead of silently implying "no matches".
+    """
+    settings = _resolve_settings(service)
+    if not settings.semantic_enabled:
+        return None, "disabled"
+    sem = _get_semantic(service)
+    if sem is None:
+        return None, "unavailable"
+    return sem, "ok"
+
+
 def _as_glob_list(value) -> list[str] | None:
     """Accept a comma-separated string or a list of globs; normalize to a list."""
     if value is None:
@@ -210,13 +229,28 @@ def search_semantic(
     don't know exact identifiers. `service` selects the index.
     `path_glob`/`exclude_glob` narrow results by repo-relative path (globs).
     """
-    sem = _get_semantic(service)
-    if sem is None:
-        return "Semantic search is disabled (Qdrant/fastembed unavailable)."
+    sem, reason = _semantic_status(service)
+    if reason == "disabled":
+        return (
+            "Semantic search is DISABLED for this service (CODE_INDEX_SEMANTIC=0). "
+            "Use search_text/search_symbol instead — they are unaffected."
+        )
+    if reason == "unavailable":
+        return (
+            "Semantic search is UNAVAILABLE (the embeddings API or Qdrant could not "
+            "be reached). This is a degraded state, NOT 'no results' — fall back to "
+            "search_text/search_symbol, which still work."
+        )
     hits = sem.search(
         query, limit=limit,
         path_glob=_as_glob_list(path_glob), exclude_glob=_as_glob_list(exclude_glob),
     )
+    if getattr(sem, "last_search_failed", False):
+        return (
+            "Semantic search FAILED mid-request (embeddings API/Qdrant error: "
+            f"{getattr(sem, 'last_error', 'unknown')}). Degraded, not empty — "
+            "use search_text/search_symbol as a fallback."
+        )
     if not hits:
         return f"No semantic matches for: {query}"
     out = []
@@ -258,10 +292,16 @@ def search_hybrid(
             + "\n".join(f"{t.path}:{t.line}: {t.content.strip()}" for t in texts)
         )
 
-    sem = _get_semantic(service)
-    if sem is not None:
+    sem, reason = _semantic_status(service)
+    if reason == "unavailable":
+        # Tell the agent the merged result is incomplete (don't hide degradation).
+        sections.append("## Semantic\n(unavailable — embeddings API/Qdrant unreachable; "
+                        "text+symbols above are unaffected)")
+    elif sem is not None:
         sem_hits = sem.search(query, limit=limit, path_glob=inc, exclude_glob=exc)
-        if sem_hits:
+        if getattr(sem, "last_search_failed", False):
+            sections.append("## Semantic\n(failed mid-request; degraded, not empty)")
+        elif sem_hits:
             sections.append(
                 "## Semantic\n"
                 + "\n".join(
@@ -311,8 +351,29 @@ def reindex(full: bool = False, service: Optional[str] = None) -> str:
 
 @mcp.tool()
 def index_stats(service: Optional[str] = None) -> str:
-    """Show how many files and symbols are currently indexed for a service."""
-    return str(_get_store(service).stats())
+    """Show index status: file/symbol counts + the semantic layer's health.
+
+    The semantic line tells you whether vector search is usable right now:
+    on/ok (with point count), disabled, or unavailable (degraded) — so you know
+    whether to trust search_semantic or fall back to text/symbols.
+    """
+    stats = _get_store(service).stats()
+    lines = [f"files={stats.get('files')} symbols={stats.get('symbols')}"]
+
+    settings = _resolve_settings(service)
+    if not settings.semantic_enabled:
+        lines.append("semantic: disabled (CODE_INDEX_SEMANTIC=0)")
+    else:
+        sem = _get_semantic(service)
+        if sem is None:
+            lines.append("semantic: unavailable (embeddings API/Qdrant unreachable)")
+        else:
+            h = sem.health()
+            if h["status"] == "ok":
+                lines.append(f"semantic: ok (collection={h['collection']}, points={h['points']})")
+            else:
+                lines.append(f"semantic: unavailable ({h['error']})")
+    return "\n".join(lines)
 
 
 def _startup_reindex() -> None:

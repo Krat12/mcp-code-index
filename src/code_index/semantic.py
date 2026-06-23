@@ -212,9 +212,14 @@ class SemanticIndex:
         # Points per Qdrant upsert (small: 4096-dim vectors -> big request body).
         self._upsert_batch: int = max(1, int(getattr(settings, "upsert_batch", 64)))
         self._score: float = float(getattr(settings, "search_score", 0) or 0)
-        # Number of points that failed to upsert in the last run (for diagnostics).
+        # Diagnostics for the run (surfaced in the index report / status / UI):
+        #   upsert_failures - points Qdrant refused (e.g. wrong dim, dropped body)
+        #   embed_failures  - chunks lost because the embeddings API kept failing
         self.upsert_failures: int = 0
+        self.embed_failures: int = 0
         self.last_error: str | None = None
+        # Set True when the most recent search() raised (degraded, not empty).
+        self.last_search_failed: bool = False
         # Cross-file buffer of pending chunks: (path, start, end, text).
         self._buf: list[tuple[str, int, int, str]] = []
         # Paths whose stale vectors must be deleted before the next upsert
@@ -362,8 +367,17 @@ class SemanticIndex:
         texts = [c[3] for c in pending]
         try:
             vectors = self._embed(texts)
-        except Exception:
+        except Exception as exc:
+            # Embeddings API kept failing after retries -> these chunks are lost
+            # for this run. Count them (don't silently drop) so the report/UI can
+            # warn that the semantic layer is incomplete.
+            self.embed_failures += len(pending)
+            self.last_error = f"{type(exc).__name__}: {exc}"
             return
+        # A short/mismatched vector batch would silently drop chunks via zip();
+        # count any shortfall instead.
+        if len(vectors) < len(pending):
+            self.embed_failures += len(pending) - len(vectors)
         points = []
         for (path, start, end, text), vec in zip(pending, vectors):
             pid = uuid.uuid5(uuid.NAMESPACE_URL, f"{path}:{start}-{end}").hex
@@ -403,6 +417,28 @@ class SemanticIndex:
             collection_name=self.collection, query_vector=vec, limit=limit
         )
 
+    def health(self) -> dict:
+        """Cheap liveness probe of the semantic backend (for status/diagnostics).
+
+        Returns {"status": "ok"|"unavailable", "collection": ..., "points": int|None,
+        "error": str|None}. Never raises. "unavailable" means the embedder/Qdrant
+        could not be reached, so semantic search will return degraded results.
+        """
+        if not self.available:
+            return {"status": "unavailable", "collection": self.collection,
+                    "points": None, "error": self.last_error or "embedder/Qdrant unavailable"}
+        try:
+            if not self._client.collection_exists(self.collection):
+                return {"status": "unavailable", "collection": self.collection,
+                        "points": 0, "error": "collection does not exist yet"}
+            info = self._client.count(collection_name=self.collection, exact=False)
+            points = getattr(info, "count", None)
+            return {"status": "ok", "collection": self.collection,
+                    "points": points, "error": None}
+        except Exception as exc:
+            return {"status": "unavailable", "collection": self.collection,
+                    "points": None, "error": f"{type(exc).__name__}: {exc}"}
+
     def search(
         self,
         query: str,
@@ -417,10 +453,15 @@ class SemanticIndex:
         pf = PathFilter(path_glob, exclude_glob)
         # Over-fetch when filtering so post-filtering still fills `limit`.
         fetch = limit * 8 if pf else limit
+        self.last_search_failed = False
         try:
             vec = self._embed([query])[0]
             res = self._query(vec, fetch)
-        except Exception:
+        except Exception as exc:
+            # Distinguish "search failed" (API/Qdrant down) from "no matches" so
+            # the caller can tell the agent the layer is degraded, not empty.
+            self.last_search_failed = True
+            self.last_error = f"{type(exc).__name__}: {exc}"
             return []
         hits: list[SemanticHit] = []
         for r in res:

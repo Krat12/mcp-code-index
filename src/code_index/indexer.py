@@ -26,6 +26,8 @@ class IndexReport:
     semantic_enabled: bool = False
     # Vectors that failed to upsert into Qdrant (0 = clean run).
     semantic_failures: int = 0
+    # Chunks lost because the embeddings API kept failing (0 = clean run).
+    semantic_embed_failures: int = 0
 
 
 def build_index(
@@ -142,10 +144,12 @@ def build_index(
         _emit(total, total, "", "embedding")
         semantic.flush()
         report.semantic_failures = getattr(semantic, "upsert_failures", 0)
-        if report.semantic_failures:
+        report.semantic_embed_failures = getattr(semantic, "embed_failures", 0)
+        if report.semantic_failures or report.semantic_embed_failures:
             log(
-                f"semantic: WARNING {report.semantic_failures} vectors failed to "
-                f"upsert (last error: {getattr(semantic, 'last_error', None)})"
+                f"semantic: WARNING {report.semantic_embed_failures} chunks failed to "
+                f"embed, {report.semantic_failures} vectors failed to upsert "
+                f"(last error: {getattr(semantic, 'last_error', None)})"
             )
 
     store.commit()

@@ -188,9 +188,13 @@ def _status_table():
             "idle": "dim",
             "error": "red",
         }.get(phase, "white")
+        lost = (st.get("semantic_embed_failures", 0) or 0) + (st.get("semantic_failures", 0) or 0)
+        phase_cell = f"[{phase_style}]{phase}[/]"
+        if lost:
+            phase_cell += f" [yellow]\u26a0 {lost} sem lost[/]"
         table.add_row(
             s.name,
-            f"[{phase_style}]{phase}[/]",
+            phase_cell,
             pct,
             str(files),
             str(syms),

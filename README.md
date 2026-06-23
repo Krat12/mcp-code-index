@@ -213,3 +213,14 @@ takes an optional `service` (name or id from `list_services`).
 - No tree-sitter? → symbols layer off, text + semantic still work.
 - Qdrant down / fastembed missing? → semantic off, text + symbols still work.
 - The text (FTS5) layer always works as long as the SQLite index exists.
+
+Degradation is **visible, not silent**:
+
+- `index_stats` reports the semantic layer's health: `ok (points=N)`,
+  `disabled` (turned off), or `unavailable` (API/Qdrant unreachable).
+- `search_semantic` / `search_hybrid` distinguish **disabled vs unavailable vs
+  "no matches"**, so the agent knows to fall back to text/symbols instead of
+  treating a down layer as an empty result.
+- Indexing counts what it couldn't store — chunks that failed to embed and
+  vectors that failed to upsert — and surfaces the totals in the run log, in
+  `status.json`, and in the `status` / web dashboards (a ⚠ marker).

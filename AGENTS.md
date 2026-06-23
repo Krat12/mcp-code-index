@@ -63,6 +63,13 @@ stdlib status page.
 - **`store.search_text` must not crash on bad FTS5 syntax.** `_fts_query` catches
   `sqlite3.OperationalError` and retries the input as a quoted phrase — preserve
   this when touching text search.
+- **Semantic degradation must stay VISIBLE, never silent.** `flush()` counts
+  lost chunks (`embed_failures`) / points (`upsert_failures`) instead of dropping
+  them; `search()` sets `last_search_failed` so callers tell "down" from "empty";
+  `health()` is a cheap liveness probe. The MCP tools (`search_semantic`,
+  `search_hybrid`, `index_stats`) report disabled vs unavailable vs empty
+  distinctly, and the indexer surfaces counts via `IndexReport` →
+  `status.json` → `status`/web UI. Don't revert these to bare `except: return []`.
 
 - **All index state lives OUTSIDE indexed repos** (deliberate): SQLite in
   `~/.cache/code-index/<id>.sqlite3`, registry in

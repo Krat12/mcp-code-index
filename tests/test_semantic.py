@@ -314,6 +314,65 @@ def test_flush_counts_upsert_failures_without_raising():
     assert idx.last_error and "WinError 10053" in idx.last_error
 
 
+def test_flush_counts_embed_failures_when_embedder_fails():
+    class _FailingEmbedder:
+        def embed(self, texts):
+            raise RuntimeError("embeddings API down")
+
+    idx = _make_index(batch=1000, embedder=_FailingEmbedder(), client=_FakeQdrant())
+    idx.embed_failures = 0
+    idx.last_search_failed = False
+    for n in range(30):
+        idx.add_chunks(f"f{n}.py", [(1, 10, f"c{n}")])
+    idx.flush()  # must not raise; chunks are counted as lost, not silently dropped
+    assert idx.embed_failures == 30
+    assert idx.last_error and "embeddings API down" in idx.last_error
+
+
+def test_flush_counts_shortfall_when_embedder_returns_too_few():
+    class _ShortEmbedder:
+        def embed(self, texts):
+            # Returns fewer vectors than inputs -> zip() would silently truncate.
+            return [[float(i), 0.0, 0.0, 0.0] for i in range(len(texts) - 5)]
+
+    idx = _make_index(batch=1000, embedder=_ShortEmbedder(), client=_FakeQdrant())
+    idx.embed_failures = 0
+    for n in range(20):
+        idx.add_chunks(f"f{n}.py", [(1, 10, f"c{n}")])
+    idx.flush()
+    assert idx.embed_failures == 5
+
+
+def test_search_sets_last_search_failed_on_error():
+    class _BoomEmbedder:
+        def embed(self, texts):
+            raise RuntimeError("API unreachable")
+
+    idx = _make_index(batch=64, embedder=_BoomEmbedder(), client=_FakeQdrant())
+    idx.last_search_failed = False
+    hits = idx.search("q", limit=5)
+    assert hits == []
+    assert idx.last_search_failed is True  # degraded, distinguishable from empty
+
+
+def test_health_ok_and_unavailable():
+    class _OkClient:
+        def collection_exists(self, name):
+            return True
+
+        def count(self, collection_name, exact=False):
+            class _C:
+                count = 42
+            return _C()
+
+    idx = _make_index(batch=64, embedder=_CountingEmbedder(), client=_OkClient())
+    h = idx.health()
+    assert h["status"] == "ok" and h["points"] == 42
+
+    idx.available = False
+    assert idx.health()["status"] == "unavailable"
+
+
 class _Pt:
     def __init__(self, path, score):
         self.score = score

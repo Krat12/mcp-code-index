@@ -103,6 +103,8 @@ def _snapshot() -> dict:
                 "indexed": st.get("indexed", 0),
                 "removed": st.get("removed", 0),
                 "semantic": st.get("semantic"),
+                "semantic_failures": st.get("semantic_failures", 0),
+                "semantic_embed_failures": st.get("semantic_embed_failures", 0),
                 "updated_at": st.get("updated_at"),
                 "finished_at": st.get("finished_at"),
                 "error": st.get("error"),
@@ -148,6 +150,7 @@ _PAGE = """<!doctype html>
                 transition: width .8s linear; }
   .phase-indexing,.phase-scanning,.phase-removing { color:#e7c14a; }
   .phase-done { color:#5fbf6b; }
+  .phase-warn { color:#e7a33a; }
   .phase-error { color:#e5534b; }
   .phase-idle { color:#778; }
   .cur { color:#9aa; font-size:.85rem; }
@@ -295,8 +298,15 @@ async function tick(){
       if (!c){ c = makeRow(s.id); tbody.appendChild(c.row); }
       const pct = s.total ? Math.round(s.done/s.total*100) : 0;
       setText(c.name, s.name);
-      setText(c.phase, s.phase + (s.error ? (': ' + s.error) : ''));
-      c.phase.className = 'phase phase-' + s.phase;
+      const lost = (s.semantic_embed_failures || 0) + (s.semantic_failures || 0);
+      let phaseText = s.phase + (s.error ? (': ' + s.error) : '');
+      if (lost > 0) phaseText += ' \u26a0 ' + lost + ' semantic lost';
+      setText(c.phase, phaseText);
+      c.phase.className = 'phase phase-' + (lost > 0 && s.phase === 'done' ? 'warn' : s.phase);
+      c.phase.title = lost > 0
+        ? (s.semantic_embed_failures || 0) + ' chunks failed to embed, '
+          + (s.semantic_failures || 0) + ' vectors failed to upsert'
+        : '';
       c.bar.style.width = pct + '%';
       setText(c.prog, s.total ? (s.done + '/' + s.total + ' (' + pct + '%)') : '');
       setText(c.files, s.files ?? '?');
