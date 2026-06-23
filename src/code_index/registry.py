@@ -101,35 +101,94 @@ def _scan_workspace(root: Path, depth: int) -> list[Path]:
     return found
 
 
-def load_registry(path: Path | None = None) -> list[Service]:
-    """Read the registry TOML and resolve it into a de-duplicated service list."""
+class RegistryError(Exception):
+    """Raised when the registry file exists but cannot be parsed.
+
+    Carries the offending path so callers can show an actionable message. Most
+    callers should prefer `load_registry` (which never raises) and only use
+    `load_registry_checked` when they want to surface the problem.
+    """
+
+    def __init__(self, path: Path, cause: Exception) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"Cannot read registry {path}: {cause}")
+
+
+def load_registry_checked(path: Path | None = None) -> list[Service]:
+    """Like `load_registry`, but raises RegistryError on a malformed TOML file.
+
+    Use this where you want to report a broken config to the user (e.g. the CLI);
+    `load_registry` swallows the error so a single typo can't take the whole MCP
+    server / watcher down.
+    """
     path = path or REGISTRY_PATH
     if not path.exists():
         return []
 
-    with path.open("rb") as f:
-        data = tomllib.load(f)
+    try:
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise RegistryError(path, exc) from exc
+    if not isinstance(data, dict):
+        raise RegistryError(path, ValueError("top-level TOML is not a table"))
 
+    return _resolve(data)
+
+
+def load_registry(path: Path | None = None) -> list[Service]:
+    """Read the registry TOML and resolve it into a de-duplicated service list.
+
+    Tolerant by design: a missing file yields an empty list, and a malformed
+    file is logged to stderr and also yields an empty list rather than crashing
+    every frontend (server/watcher/CLI/web all call this). Use
+    `load_registry_checked` if you need the error surfaced.
+    """
+    try:
+        return load_registry_checked(path)
+    except RegistryError as exc:
+        print(f"[code-index] WARNING: {exc}; treating registry as empty", file=sys.stderr)
+        return []
+
+
+def _resolve(data: dict) -> list[Service]:
     services: dict[str, Service] = {}  # keyed by resolved abs path
 
-    for entry in data.get("service", []):
-        raw = entry.get("path")
-        if not raw:
+    entries = data.get("service", [])
+    if isinstance(entries, dict):  # tolerate a single [service] table
+        entries = [entries]
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
             continue
-        p = Path(raw).expanduser().resolve()
+        raw = entry.get("path")
+        if not raw or not isinstance(raw, str):
+            continue
+        try:
+            p = Path(raw).expanduser().resolve()
+        except (OSError, ValueError):
+            continue
         name = entry.get("name") or p.name
         services[str(p)] = Service(
-            name=name,
+            name=str(name),
             path=p,
             ignore=_as_str_list(entry.get("ignore")),
             use_gitignore=_as_bool(entry.get("use_gitignore")),
         )
 
-    for ws in data.get("workspace", []):
-        raw = ws.get("path")
-        if not raw:
+    workspaces = data.get("workspace", [])
+    if isinstance(workspaces, dict):
+        workspaces = [workspaces]
+    for ws in workspaces if isinstance(workspaces, list) else []:
+        if not isinstance(ws, dict):
             continue
-        depth = int(ws.get("depth", 1))
+        raw = ws.get("path")
+        if not raw or not isinstance(raw, str):
+            continue
+        try:
+            depth = int(ws.get("depth", 1))
+        except (TypeError, ValueError):
+            depth = 1
         # Auto-discovered repos inherit the workspace's ignore configuration.
         ws_ignore = _as_str_list(ws.get("ignore"))
         ws_gitignore = _as_bool(ws.get("use_gitignore"))

@@ -2,7 +2,15 @@
 
 from pathlib import Path
 
-from code_index.registry import add_service, add_workspace, load_registry
+import pytest
+
+from code_index.registry import (
+    RegistryError,
+    add_service,
+    add_workspace,
+    load_registry,
+    load_registry_checked,
+)
 from code_index.config import project_id
 
 
@@ -120,3 +128,38 @@ def test_workspace_ignore_inherited(tmp_path):
     for s in services:
         assert s.ignore == ["dist/**"]
         assert s.use_gitignore is True
+
+
+# --- robustness: a malformed registry must not crash every frontend ---------
+
+
+def test_malformed_toml_does_not_crash_load_registry(tmp_path, capsys):
+    reg = tmp_path / "projects.toml"
+    reg.write_text("[[service]\nthis is not valid toml = = =\n", encoding="utf-8")
+    # Tolerant loader returns empty (and warns) instead of raising.
+    assert load_registry(reg) == []
+    assert "registry" in capsys.readouterr().err.lower()
+
+
+def test_malformed_toml_raises_in_checked_variant(tmp_path):
+    reg = tmp_path / "projects.toml"
+    reg.write_text("nonsense = = =\n", encoding="utf-8")
+    with pytest.raises(RegistryError) as ei:
+        load_registry_checked(reg)
+    assert ei.value.path == reg
+
+
+def test_garbage_entries_are_skipped_not_fatal(tmp_path):
+    reg = tmp_path / "projects.toml"
+    # path missing / not a string / depth not an int -> entries skipped, no crash
+    reg.write_text(
+        "[[service]]\n"
+        "name = \"no-path\"\n"  # missing path -> skipped
+        "\n"
+        "[[workspace]]\n"
+        f'path = "{tmp_path.as_posix()}/ws"\n'
+        'depth = "lots"\n',  # bad depth -> defaults to 1, no crash
+        encoding="utf-8",
+    )
+    # Should not raise; the broken service entry is simply skipped.
+    assert isinstance(load_registry(reg), list)

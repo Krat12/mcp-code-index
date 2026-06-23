@@ -1,6 +1,8 @@
 """Store: FTS5 text search, symbol storage/search, incremental metadata."""
 
-from code_index.store import Store
+import pytest
+
+from code_index.store import Store, StoreError
 from code_index.symbols import Symbol
 
 
@@ -136,3 +138,18 @@ def test_get_lines_returns_stored_span(tmp_path):
     assert [r.content for r in rows] == ["l2", "l3", "l4"]
     assert s.get_lines("missing.py", 1, 3) == []
     s.close()
+
+
+def test_busy_timeout_pragma_set(tmp_path):
+    s = _store(tmp_path)
+    val = s.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert val >= 1000  # a generous wait so two writers don't instantly error
+    s.close()
+
+
+def test_corrupt_db_raises_store_error(tmp_path):
+    bad = tmp_path / "corrupt.sqlite3"
+    # A file that is NOT a valid SQLite database.
+    bad.write_bytes(b"this is definitely not sqlite" * 100)
+    with pytest.raises(StoreError):
+        Store(bad)

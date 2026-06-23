@@ -57,14 +57,36 @@ class SymbolHit:
     end_line: int
 
 
+# How long SQLite waits for a lock before giving up (ms). With WAL, readers
+# don't block the writer, but TWO writers (e.g. the watcher and a manual
+# reindex) still serialize; a generous busy_timeout lets the loser wait its turn
+# instead of raising "database is locked" immediately.
+BUSY_TIMEOUT_MS = 15_000
+
+
+class StoreError(Exception):
+    """Raised when the SQLite index cannot be opened (e.g. corrupt file)."""
+
+
 class Store:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
-        self.conn = sqlite3.connect(str(db_path))
-        self.conn.row_factory = sqlite3.Row
-        self._apply_pragmas()
-        self.conn.executescript(SCHEMA)
-        self.conn.commit()
+        try:
+            # timeout= is the Python-level busy wait; PRAGMA busy_timeout covers
+            # the same at the SQLite level (belt and suspenders).
+            self.conn = sqlite3.connect(str(db_path), timeout=BUSY_TIMEOUT_MS / 1000)
+            self.conn.row_factory = sqlite3.Row
+            self._apply_pragmas()
+            self.conn.executescript(SCHEMA)
+            self.conn.commit()
+        except sqlite3.DatabaseError as exc:
+            # Corrupt/unreadable DB or missing FTS5 support: fail with a clear,
+            # actionable message instead of a bare traceback. The index is
+            # rebuildable, so the fix is to delete the file and re-index.
+            raise StoreError(
+                f"Cannot open index {db_path}: {exc}. "
+                f"The index may be corrupt; delete it and re-index."
+            ) from exc
 
     def _apply_pragmas(self) -> None:
         """Speed up bulk inserts dramatically vs. SQLite defaults.
@@ -81,6 +103,7 @@ class Store:
             "PRAGMA temp_store=MEMORY",
             "PRAGMA cache_size=-65536",   # ~64MB page cache
             "PRAGMA mmap_size=268435456",  # 256MB memory-mapped I/O
+            f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}",
         ):
             try:
                 self.conn.execute(pragma)

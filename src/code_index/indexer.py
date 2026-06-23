@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 
 from .config import Settings
@@ -9,6 +10,10 @@ from .semantic import SemanticIndex
 from .store import Store
 from .symbols import SymbolExtractor, lang_for_ext
 from .walker import build_ignore_spec, chunk_lines, iter_files, read_text, rel
+
+
+class IndexLockedError(Exception):
+    """Indexing aborted because another writer holds the SQLite lock."""
 
 
 @dataclass
@@ -164,6 +169,26 @@ def run_index(settings: Settings, full: bool = False, reporter=None, log=lambda 
             pass
     try:
         report = build_index(settings, full=full, log=log, on_progress=reporter)
+    except sqlite3.OperationalError as exc:
+        # Most likely a second writer (watcher + manual reindex) couldn't get
+        # the lock within busy_timeout. Give a clear, actionable message.
+        if "locked" in str(exc).lower():
+            friendly = IndexLockedError(
+                f"index for '{settings.root.name}' is busy (another reindex is "
+                f"running); try again shortly"
+            )
+            if reporter is not None:
+                try:
+                    reporter.error(friendly)
+                except Exception:
+                    pass
+            raise friendly from exc
+        if reporter is not None:
+            try:
+                reporter.error(exc)
+            except Exception:
+                pass
+        raise
     except BaseException as exc:
         if reporter is not None:
             try:

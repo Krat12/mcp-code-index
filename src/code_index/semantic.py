@@ -12,6 +12,7 @@ instance (your Docker) serves every project/microservice.
 from __future__ import annotations
 
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -28,6 +29,16 @@ class SemanticHit:
     end_line: int
     score: float
     preview: str
+
+
+class EmbeddingResponseError(Exception):
+    """The embeddings endpoint returned HTTP 200 but a malformed/unusable body.
+
+    Distinct from network/HTTP errors: it means the *model/proxy* gave us junk
+    (wrong shape, missing vectors, wrong count, non-finite numbers). We treat it
+    as retryable (a flaky proxy may return an HTML error page once) but, if it
+    persists, it surfaces clearly instead of silently dropping vectors.
+    """
 
 
 class Embedder(Protocol):
@@ -73,10 +84,60 @@ class ApiEmbedder:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        # OpenAI shape: {"data": [{"embedding": [...]}, ...]}
-        data = sorted(body.get("data", []), key=lambda d: d.get("index", 0))
-        return [list(map(float, d["embedding"])) for d in data]
+            raw = resp.read()
+        return self._parse_response(raw, expected=len(inputs))
+
+    def _parse_response(self, raw: bytes, expected: int) -> list[list[float]]:
+        """Parse and VALIDATE an embeddings response body.
+
+        Guards against HTTP-200-but-garbage: non-JSON bodies (proxy/HTML error
+        pages), missing/short `data`, missing/empty `embedding`, non-numeric or
+        non-finite (NaN/Inf) values, and inconsistent vector dimensions. Raises
+        EmbeddingResponseError so the caller can retry / surface it rather than
+        silently truncating via zip().
+        """
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            snippet = raw[:120].decode("utf-8", errors="replace")
+            raise EmbeddingResponseError(f"non-JSON embeddings response: {snippet!r}") from exc
+
+        if not isinstance(body, dict):
+            raise EmbeddingResponseError(f"embeddings response is not an object: {type(body).__name__}")
+        # Surface an OpenAI-style error object instead of treating it as empty.
+        if "data" not in body and isinstance(body.get("error"), (dict, str)):
+            raise EmbeddingResponseError(f"embeddings API error: {body['error']}")
+        data = body.get("data")
+        if not isinstance(data, list):
+            raise EmbeddingResponseError("embeddings response missing a 'data' list")
+        if len(data) != expected:
+            raise EmbeddingResponseError(
+                f"embeddings count mismatch: got {len(data)} for {expected} inputs"
+            )
+
+        data = sorted(data, key=lambda d: d.get("index", 0) if isinstance(d, dict) else 0)
+        out: list[list[float]] = []
+        dim: int | None = None
+        for i, d in enumerate(data):
+            if not isinstance(d, dict) or "embedding" not in d:
+                raise EmbeddingResponseError(f"embeddings[{i}] has no 'embedding' field")
+            emb = d["embedding"]
+            if not isinstance(emb, list) or not emb:
+                raise EmbeddingResponseError(f"embeddings[{i}] is empty or not a list")
+            try:
+                vec = [float(x) for x in emb]
+            except (TypeError, ValueError) as exc:
+                raise EmbeddingResponseError(f"embeddings[{i}] has non-numeric values") from exc
+            if any(not math.isfinite(x) for x in vec):
+                raise EmbeddingResponseError(f"embeddings[{i}] contains NaN/Inf")
+            if dim is None:
+                dim = len(vec)
+            elif len(vec) != dim:
+                raise EmbeddingResponseError(
+                    f"inconsistent vector dim: {len(vec)} vs {dim}"
+                )
+            out.append(vec)
+        return out
 
     def _post(self, inputs: list[str]) -> list[list[float]]:
         last: Exception | None = None

@@ -10,7 +10,7 @@ import urllib.error
 
 import pytest
 
-from code_index.semantic import ApiEmbedder, SemanticIndex
+from code_index.semantic import ApiEmbedder, EmbeddingResponseError, SemanticIndex
 
 
 class _FakeResp(io.BytesIO):
@@ -84,6 +84,82 @@ def test_api_embedder_gives_up_after_retries(monkeypatch):
 def test_api_embedder_strips_trailing_slash():
     emb = ApiEmbedder(api_base="https://example/api/v1/", model="m", api_key="k")
     assert emb._url == "https://example/api/v1/embeddings"
+
+
+# --- response validation: HTTP 200 but garbage body --------------------------
+
+
+def _emb():
+    return ApiEmbedder(api_base="https://x/v1", model="m", api_key="k", max_retries=0)
+
+
+def test_parse_rejects_non_json():
+    with pytest.raises(EmbeddingResponseError):
+        _emb()._parse_response(b"<html>502 Bad Gateway</html>", expected=1)
+
+
+def test_parse_rejects_count_mismatch():
+    body = json.dumps({"data": [{"index": 0, "embedding": [1.0, 2.0]}]}).encode()
+    with pytest.raises(EmbeddingResponseError):
+        _emb()._parse_response(body, expected=2)  # asked for 2, got 1
+
+
+def test_parse_rejects_missing_embedding_field():
+    body = json.dumps({"data": [{"index": 0}]}).encode()
+    with pytest.raises(EmbeddingResponseError):
+        _emb()._parse_response(body, expected=1)
+
+
+def test_parse_rejects_non_numeric_and_nan():
+    bad_str = json.dumps({"data": [{"index": 0, "embedding": ["a", "b"]}]}).encode()
+    with pytest.raises(EmbeddingResponseError):
+        _emb()._parse_response(bad_str, expected=1)
+    # NaN is valid JSON for Python's json module (allow_nan default) -> must be caught.
+    nan_body = b'{"data": [{"index": 0, "embedding": [NaN, 1.0]}]}'
+    with pytest.raises(EmbeddingResponseError):
+        _emb()._parse_response(nan_body, expected=1)
+
+
+def test_parse_rejects_inconsistent_dim():
+    body = json.dumps({"data": [
+        {"index": 0, "embedding": [1.0, 2.0, 3.0]},
+        {"index": 1, "embedding": [1.0, 2.0]},
+    ]}).encode()
+    with pytest.raises(EmbeddingResponseError):
+        _emb()._parse_response(body, expected=2)
+
+
+def test_parse_surfaces_api_error_object():
+    body = json.dumps({"error": {"message": "rate limited", "code": 429}}).encode()
+    with pytest.raises(EmbeddingResponseError):
+        _emb()._parse_response(body, expected=1)
+
+
+def test_parse_accepts_valid_response_and_orders_by_index():
+    body = json.dumps({"data": [
+        {"index": 1, "embedding": [9.0, 9.0]},
+        {"index": 0, "embedding": [1.0, 1.0]},
+    ]}).encode()
+    vecs = _emb()._parse_response(body, expected=2)
+    assert vecs == [[1.0, 1.0], [9.0, 9.0]]  # reordered by 'index'
+
+
+def test_bad_response_is_retried(monkeypatch):
+    calls = {"n": 0}
+
+    def flaky(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            return _FakeResp(b"not json")  # garbage once
+        body = json.dumps({"data": [{"index": 0, "embedding": [1.0, 2.0]}]})
+        return _FakeResp(body.encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", flaky)
+    monkeypatch.setattr("code_index.semantic.time.sleep", lambda *_: None)
+    emb = ApiEmbedder(api_base="https://x/v1", model="m", api_key="k", max_retries=2)
+    vecs = emb.embed(["one"])
+    assert vecs == [[1.0, 2.0]]
+    assert calls["n"] == 2
 
 
 def test_api_embedder_parallel_preserves_order(monkeypatch):
