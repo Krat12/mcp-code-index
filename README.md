@@ -12,6 +12,21 @@ Three search layers, one server:
 | **symbols** | **tree-sitter** | "where is `X` defined", file outline |
 | **semantic** | **fastembed** (local) → **Qdrant** | fuzzy "where do we do Y" |
 
+## Don't want to configure this yourself? Let your agent do it
+
+You don't need to learn the env vars, registry file, or Qdrant. Just tell your
+coding agent (Kilo CLI / OpenCode) to set it up from the runbook:
+
+> **"Set up code-index for me, following the instructions at
+> https://github.com/Krat12/mcp-code-index/blob/main/docs/AGENT_SETUP.md"**
+
+The agent reads [`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md), checks your
+environment, asks you only the few things it can't decide (which repos, your
+embeddings API key, what to ignore), wires everything up, builds the index, and
+tells you where everything lives — without writing anything into your repos. The
+rest of this README is the manual reference for those who prefer to do it by
+hand.
+
 ## Requirements
 
 - Python 3.10+
