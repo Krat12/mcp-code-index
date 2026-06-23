@@ -86,3 +86,53 @@ def test_stats_counts(tmp_path):
     assert st["files"] == 2
     assert st["symbols"] == 1
     s.close()
+
+
+def test_search_text_path_glob_filters(tmp_path):
+    s = _store(tmp_path)
+    s.upsert_file("backend/svc.py", 1.0, 5, "python", "def dedup():\n    pass\n", [])
+    s.upsert_file("backend/tests/test_svc.py", 1.0, 5, "python", "def test_dedup():\n    pass\n", [])
+    s.commit()
+
+    only_backend = s.search_text("dedup", path_glob=["backend/**"])
+    assert {h.path for h in only_backend} == {"backend/svc.py", "backend/tests/test_svc.py"}
+
+    no_tests = s.search_text("dedup", exclude_glob=["**/tests/**"])
+    assert [h.path for h in no_tests] == ["backend/svc.py"]
+
+    only_tests = s.search_text("dedup", path_glob=["**/tests/**"])
+    assert [h.path for h in only_tests] == ["backend/tests/test_svc.py"]
+    s.close()
+
+
+def test_search_symbol_path_glob_filters(tmp_path):
+    s = _store(tmp_path)
+    s.upsert_file("backend/a.py", 1.0, 5, "python", "x\n", [Symbol("dedup", "function", 1, 2)])
+    s.upsert_file("backend/tests/b.py", 1.0, 5, "python", "y\n", [Symbol("dedup_test", "function", 1, 2)])
+    s.commit()
+
+    hits = s.search_symbol("dedup", exclude_glob=["**/tests/**"])
+    assert [h.path for h in hits] == ["backend/a.py"]
+    s.close()
+
+
+def test_search_text_robust_to_bad_fts_query(tmp_path):
+    s = _store(tmp_path)
+    s.upsert_file("a.py", 1.0, 5, "python", "value = compute(x)\n", [])
+    s.commit()
+    # Unbalanced paren / quote would normally raise OperationalError in FTS5.
+    assert s.search_text("compute(x") != []  # falls back to a phrase query
+    assert isinstance(s.search_text('"oops'), list)  # no crash
+    assert isinstance(s.search_text("AND OR NOT"), list)  # dangling operators
+    s.close()
+
+
+def test_get_lines_returns_stored_span(tmp_path):
+    s = _store(tmp_path)
+    s.upsert_file("a.py", 1.0, 5, "python", "l1\nl2\nl3\nl4\nl5\n", [])
+    s.commit()
+    rows = s.get_lines("a.py", 2, 4)
+    assert [r.line for r in rows] == [2, 3, 4]
+    assert [r.content for r in rows] == ["l2", "l3", "l4"]
+    assert s.get_lines("missing.py", 1, 3) == []
+    s.close()

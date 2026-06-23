@@ -186,6 +186,24 @@ class Settings:
     # Optional explicit vector size; if 0 we auto-detect from the first response.
     embed_dim: int = field(default_factory=lambda: int(_env("CODE_INDEX_EMBED_DIM", "0")))
 
+    # How many chunks to embed per API request. The indexer fills a GLOBAL
+    # buffer across files and flushes in batches of this size, so a repo with
+    # thousands of tiny files makes ~N/batch requests instead of one per file.
+    embed_batch: int = field(default_factory=lambda: max(1, int(_env("CODE_INDEX_EMBED_BATCH", "64"))))
+    # How many embedding requests to run IN PARALLEL. The bottleneck is API
+    # latency (~8s per batch on an 8B model), not local CPU, so concurrency is
+    # nearly free on a weak laptop yet cuts wall-time several-fold.
+    embed_concurrency: int = field(default_factory=lambda: max(1, int(_env("CODE_INDEX_EMBED_CONCURRENCY", "6"))))
+    # How many points to send per Qdrant upsert request. High-dim vectors (e.g.
+    # 4096) make a few hundred points a multi-MB body that Qdrant/HTTP can drop
+    # (WinError 10053), so we upsert in conservative sub-batches. Independent of
+    # the embedding batch/buffer size.
+    upsert_batch: int = field(default_factory=lambda: max(1, int(_env("CODE_INDEX_UPSERT_BATCH", "64"))))
+    # Retries (with exponential backoff) for a failed embeddings request.
+    embed_max_retries: int = field(default_factory=lambda: max(0, int(_env("CODE_INDEX_EMBED_RETRIES", "3"))))
+    # Optional minimum cosine score for semantic hits (0 = no threshold).
+    search_score: float = field(default_factory=lambda: float(_env("CODE_INDEX_SEARCH_SCORE", "0")))
+
     # Per-project ignore configuration (from the external projects.toml).
     # Extra glob patterns to exclude, matched against POSIX-relative paths.
     ignore_globs: list[str] = field(default_factory=list)

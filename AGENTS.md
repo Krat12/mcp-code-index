@@ -51,6 +51,18 @@ stdlib status page.
   `iter_files(root, spec=None)` keeps its old behavior when `spec` is None.
   Resolve a service's `Settings` via `service.settings()` so the ignore config
   flows through (CLI/watcher/server already do this).
+- **Search-result path filtering reuses the ignore matcher.** `walker.PathFilter`
+  wraps `IgnoreSpec` for include/exclude globs; `store.search_text`/`search_symbol`
+  and `SemanticIndex.search` take `path_glob`/`exclude_glob` and post-filter
+  (over-fetching `limit*8` first). The MCP search tools expose these via
+  `_as_glob_list` (comma-string or list). Don't add a second glob engine.
+- **`read_span` closes the search→read loop inside the server.** `walker.read_span`
+  reads live-disk lines with a path-traversal guard (the relpath must stay under
+  the repo root); the `read_span` MCP tool falls back to `store.get_lines` (the
+  stored FTS copy) when the file changed/vanished. Keep the guard.
+- **`store.search_text` must not crash on bad FTS5 syntax.** `_fts_query` catches
+  `sqlite3.OperationalError` and retries the input as a quoted phrase — preserve
+  this when touching text search.
 
 - **All index state lives OUTSIDE indexed repos** (deliberate): SQLite in
   `~/.cache/code-index/<id>.sqlite3`, registry in

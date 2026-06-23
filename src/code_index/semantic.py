@@ -12,9 +12,11 @@ instance (your Docker) serves every project/microservice.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -33,9 +35,22 @@ class Embedder(Protocol):
 
 
 class ApiEmbedder:
-    """OpenAI-compatible /embeddings client over stdlib urllib (batched)."""
+    """OpenAI-compatible /embeddings client over stdlib urllib (batched).
 
-    def __init__(self, api_base: str, model: str, api_key: str | None, batch: int = 64, timeout: float = 60.0) -> None:
+    Retries a failed request `max_retries` times with exponential backoff so a
+    transient network/API blip does not abort a whole indexing run.
+    """
+
+    def __init__(
+        self,
+        api_base: str,
+        model: str,
+        api_key: str | None,
+        batch: int = 64,
+        timeout: float = 60.0,
+        max_retries: int = 3,
+        concurrency: int = 6,
+    ) -> None:
         if not api_key:
             raise RuntimeError("CODE_INDEX_EMBED_API_KEY is not set for the api embed backend")
         self._url = api_base.rstrip("/") + "/embeddings"
@@ -43,8 +58,10 @@ class ApiEmbedder:
         self._key = api_key
         self._batch = batch
         self._timeout = timeout
+        self._max_retries = max(0, max_retries)
+        self._concurrency = max(1, concurrency)
 
-    def _post(self, inputs: list[str]) -> list[list[float]]:
+    def _post_once(self, inputs: list[str]) -> list[list[float]]:
         payload = json.dumps({"model": self._model, "input": inputs}).encode("utf-8")
         req = urllib.request.Request(
             self._url,
@@ -61,10 +78,35 @@ class ApiEmbedder:
         data = sorted(body.get("data", []), key=lambda d: d.get("index", 0))
         return [list(map(float, d["embedding"])) for d in data]
 
+    def _post(self, inputs: list[str]) -> list[list[float]]:
+        last: Exception | None = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                return self._post_once(inputs)
+            except Exception as exc:  # network/HTTP/parse errors -> retry
+                last = exc
+                if attempt < self._max_retries:
+                    time.sleep(min(8.0, 0.5 * (2 ** attempt)))  # 0.5,1,2,4,...
+        raise last if last is not None else RuntimeError("embeddings request failed")
+
     def embed(self, texts: list[str]) -> list[list[float]]:
-        out: list[list[float]] = []
-        for i in range(0, len(texts), self._batch):
-            out.extend(self._post(texts[i : i + self._batch]))
+        # Split into sub-batches and run requests in parallel: the cost is API
+        # latency (we just wait on the network), so this barely touches local
+        # CPU/RAM yet cuts wall-time several-fold on big repos.
+        sub_batches = [texts[i : i + self._batch] for i in range(0, len(texts), self._batch)]
+        if len(sub_batches) <= 1 or self._concurrency == 1:
+            out: list[list[float]] = []
+            for sb in sub_batches:
+                out.extend(self._post(sb))
+            return out
+
+        workers = min(self._concurrency, len(sub_batches))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # executor.map preserves input order, so vectors stay aligned.
+            results = list(pool.map(self._post, sub_batches))
+        out = []
+        for r in results:
+            out.extend(r)
         return out
 
 
@@ -89,6 +131,9 @@ def _make_embedder(settings) -> Embedder:
         api_base=settings.embed_api_base,
         model=settings.embed_api_model,
         api_key=settings.embed_api_key,
+        batch=getattr(settings, "embed_batch", 64),
+        max_retries=getattr(settings, "embed_max_retries", 3),
+        concurrency=getattr(settings, "embed_concurrency", 6),
     )
 
 
@@ -99,6 +144,22 @@ class SemanticIndex:
         self.collection = settings.collection_name()
         self.available = True
         self._dim: int | None = settings.embed_dim or None
+        self._batch: int = max(1, int(getattr(settings, "embed_batch", 64)))
+        self._concurrency: int = max(1, int(getattr(settings, "embed_concurrency", 6)))
+        # Accumulate enough chunks to feed every parallel worker before flushing.
+        self._flush_at: int = self._batch * self._concurrency
+        # Points per Qdrant upsert (small: 4096-dim vectors -> big request body).
+        self._upsert_batch: int = max(1, int(getattr(settings, "upsert_batch", 64)))
+        self._score: float = float(getattr(settings, "search_score", 0) or 0)
+        # Number of points that failed to upsert in the last run (for diagnostics).
+        self.upsert_failures: int = 0
+        self.last_error: str | None = None
+        # Cross-file buffer of pending chunks: (path, start, end, text).
+        self._buf: list[tuple[str, int, int, str]] = []
+        # Paths whose stale vectors must be deleted before the next upsert
+        # (incremental runs only; a full run recreates the collection instead).
+        self._pending_delete: set[str] = set()
+        self._delete_before_upsert: bool = True
         try:
             from qdrant_client import QdrantClient
 
@@ -133,43 +194,117 @@ class SemanticIndex:
         except Exception:
             exists = False
         if not exists:
-            self._client.create_collection(
-                collection_name=self.collection,
-                vectors_config=models.VectorParams(
-                    size=self._dim or 384, distance=models.Distance.COSINE
-                ),
-            )
+            self._create()
+
+    def _create(self) -> None:
+        from qdrant_client import models
+
+        self._client.create_collection(
+            collection_name=self.collection,
+            vectors_config=models.VectorParams(
+                size=self._dim or 384, distance=models.Distance.COSINE
+            ),
+        )
+
+    def begin(self, full: bool) -> None:
+        """Prepare for an indexing run.
+
+        full=True  -> recreate the collection once (no per-file deletes needed).
+        full=False -> keep the collection; stale vectors of changed/removed
+                      files are batch-deleted just before the matching upsert.
+        """
+        if not self.available:
+            return
+        if full:
+            self._delete_before_upsert = False
+            self.recreate_collection()
+        else:
+            self._delete_before_upsert = True
+
+    def recreate_collection(self) -> None:
+        """Drop and recreate the collection (used for a `--full` rebuild).
+
+        One cheap operation instead of a per-file delete for every path; the
+        whole collection is being repopulated anyway.
+        """
+        if not self.available:
+            return
+        if self._dim is None:
+            # Need a vector size before (re)creating; probe once.
+            try:
+                self._embed(["dimension probe"])
+            except Exception:
+                self.available = False
+                return
+        try:
+            if self._client.collection_exists(self.collection):
+                self._client.delete_collection(self.collection)
+            self._create()
+        except Exception:
+            self.available = False
 
     def delete_path(self, path: str) -> None:
-        if not self.available:
+        self.delete_paths([path])
+
+    def delete_paths(self, paths: list[str]) -> None:
+        """Delete all points for the given paths in ONE request."""
+        if not self.available or not paths:
             return
         from qdrant_client import models
 
         try:
+            # wait=True so a later (wait=False) upsert of the same deterministic
+            # point ids can never be clobbered by a delete that lands afterwards.
             self._client.delete(
                 collection_name=self.collection,
                 points_selector=models.FilterSelector(
                     filter=models.Filter(
-                        must=[models.FieldCondition(key="path", match=models.MatchValue(value=path))]
+                        must=[
+                            models.FieldCondition(
+                                key="path", match=models.MatchAny(any=list(paths))
+                            )
+                        ]
                     )
                 ),
+                wait=True,
             )
         except Exception:
             pass
 
-    def index_chunks(self, path: str, chunks: list[tuple[int, int, str]]) -> None:
-        """chunks: list of (start_line, end_line, text)."""
+    def add_chunks(self, path: str, chunks: list[tuple[int, int, str]]) -> None:
+        """Queue a file's chunks; flush automatically once the buffer is full.
+
+        chunks: list of (start_line, end_line, text). Embedding+upsert happen in
+        `flush()` so chunks from MANY files share one API request / upsert.
+        """
         if not self.available or not chunks:
+            return
+        if self._delete_before_upsert:
+            self._pending_delete.add(path)
+        for start, end, text in chunks:
+            self._buf.append((path, start, end, text))
+        if len(self._buf) >= self._flush_at:
+            self.flush()
+
+    def flush(self) -> None:
+        """Embed and upsert all buffered chunks (no-op if the buffer is empty)."""
+        # Drop stale vectors for changed paths first (incremental runs).
+        if self._pending_delete:
+            self.delete_paths(list(self._pending_delete))
+            self._pending_delete.clear()
+        if not self.available or not self._buf:
             return
         from qdrant_client import models
 
-        texts = [c[2] for c in chunks]
+        pending = self._buf
+        self._buf = []
+        texts = [c[3] for c in pending]
         try:
             vectors = self._embed(texts)
         except Exception:
             return
         points = []
-        for (start, end, text), vec in zip(chunks, vectors):
+        for (path, start, end, text), vec in zip(pending, vectors):
             pid = uuid.uuid5(uuid.NAMESPACE_URL, f"{path}:{start}-{end}").hex
             points.append(
                 models.PointStruct(
@@ -183,7 +318,17 @@ class SemanticIndex:
                     },
                 )
             )
-        self._client.upsert(collection_name=self.collection, points=points, wait=True)
+        # Upsert in small sub-batches: high-dim vectors make a few hundred points
+        # a multi-MB body that Qdrant can drop mid-stream (WinError 10053).
+        for i in range(0, len(points), self._upsert_batch):
+            sub = points[i : i + self._upsert_batch]
+            try:
+                self._client.upsert(collection_name=self.collection, points=sub, wait=False)
+            except Exception as exc:
+                # Don't kill the whole run, but DON'T swallow silently either:
+                # count the loss and remember the last error for diagnostics.
+                self.upsert_failures += len(sub)
+                self.last_error = f"{type(exc).__name__}: {exc}"
 
     def _query(self, vec: list[float], limit: int):
         """Vector search, compatible with both new (query_points) and old (search) clients."""
@@ -197,24 +342,43 @@ class SemanticIndex:
             collection_name=self.collection, query_vector=vec, limit=limit
         )
 
-    def search(self, query: str, limit: int = 10) -> list[SemanticHit]:
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        path_glob: list[str] | None = None,
+        exclude_glob: list[str] | None = None,
+    ) -> list[SemanticHit]:
         if not self.available:
             return []
+        from .walker import PathFilter
+
+        pf = PathFilter(path_glob, exclude_glob)
+        # Over-fetch when filtering so post-filtering still fills `limit`.
+        fetch = limit * 8 if pf else limit
         try:
             vec = self._embed([query])[0]
-            res = self._query(vec, limit)
+            res = self._query(vec, fetch)
         except Exception:
             return []
         hits: list[SemanticHit] = []
         for r in res:
+            score = float(r.score)
+            if self._score and score < self._score:
+                continue
             p = r.payload or {}
+            path = p.get("path", "?")
+            if pf and not pf.match(path):
+                continue
             hits.append(
                 SemanticHit(
-                    path=p.get("path", "?"),
+                    path=path,
                     start_line=int(p.get("start_line", 0)),
                     end_line=int(p.get("end_line", 0)),
-                    score=float(r.score),
+                    score=score,
                     preview=p.get("preview", ""),
                 )
             )
+            if len(hits) >= limit:
+                break
         return hits

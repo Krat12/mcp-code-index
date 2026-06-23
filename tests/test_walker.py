@@ -2,10 +2,12 @@
 
 from code_index.walker import (
     IgnoreSpec,
+    PathFilter,
     build_ignore_spec,
     chunk_lines,
     iter_files,
     read_gitignore,
+    read_span,
     read_text,
     rel,
     _keep_dir,
@@ -123,3 +125,63 @@ def test_build_spec_without_gitignore_skips_file(tmp_path):
     spec = build_ignore_spec(["keep_me_out/**"], use_gitignore=False, root=tmp_path)
     assert not spec.match("app.log")  # gitignore not consulted
     assert spec.match("keep_me_out/x.py")
+
+
+# --- PathFilter (search-result include/exclude) ----------------------------
+
+
+def test_path_filter_empty_matches_everything():
+    pf = PathFilter()
+    assert bool(pf) is False
+    assert pf.match("anything/at/all.py") is True
+
+
+def test_path_filter_include_only():
+    pf = PathFilter(include=["backend/**"])
+    assert pf.match("backend/svc.py") is True
+    assert pf.match("frontend/app.tsx") is False
+
+
+def test_path_filter_exclude_only():
+    pf = PathFilter(exclude=["**/tests/**"])
+    assert pf.match("backend/svc.py") is True
+    assert pf.match("backend/tests/test_svc.py") is False
+
+
+def test_path_filter_include_and_exclude():
+    pf = PathFilter(include=["backend/**"], exclude=["**/tests/**"])
+    assert pf.match("backend/svc.py") is True
+    assert pf.match("backend/tests/test_svc.py") is False  # excluded wins
+    assert pf.match("frontend/app.tsx") is False  # not included
+
+
+# --- read_span (read source lines back) ------------------------------------
+
+
+def test_read_span_basic_and_context(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_text("\n".join(f"line{i}" for i in range(1, 11)) + "\n", encoding="utf-8")
+    # lines 3..5 inclusive
+    assert read_span(tmp_path, "a.py", 3, 5) == "line3\nline4\nline5"
+    # with context = 1 on each side
+    assert read_span(tmp_path, "a.py", 3, 5, context=1) == "line2\nline3\nline4\nline5\nline6"
+
+
+def test_read_span_clamps_bounds(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_text("l1\nl2\nl3\n", encoding="utf-8")
+    # end beyond EOF is clamped
+    assert read_span(tmp_path, "a.py", 2, 99) == "l2\nl3"
+    # start before 1 with context is clamped
+    assert read_span(tmp_path, "a.py", 1, 1, context=5) == "l1\nl2\nl3"
+
+
+def test_read_span_path_traversal_guard(tmp_path):
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "secret.txt").write_text("TOPSECRET\n", encoding="utf-8")
+    # Trying to escape the repo root must be refused.
+    assert read_span(tmp_path / "repo", "../secret.txt", 1, 1) is None
+
+
+def test_read_span_missing_file_returns_none(tmp_path):
+    assert read_span(tmp_path, "does_not_exist.py", 1, 5) is None

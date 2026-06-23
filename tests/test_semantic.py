@@ -6,6 +6,7 @@ API key is required. The SemanticIndex is tested for graceful degradation.
 
 import io
 import json
+import urllib.error
 
 import pytest
 
@@ -49,9 +50,65 @@ def test_api_embedder_requires_key():
         ApiEmbedder(api_base="https://x/v1", model="m", api_key=None)
 
 
+def test_api_embedder_retries_then_succeeds(monkeypatch):
+    calls = {"n": 0}
+
+    def flaky_urlopen(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3:  # fail twice, succeed on the 3rd attempt
+            raise urllib.error.URLError("boom")
+        body = json.loads(req.data.decode("utf-8"))
+        return _FakeResp(json.dumps(_fake_openai_response(body["input"])).encode("utf-8"))
+
+    monkeypatch.setattr("urllib.request.urlopen", flaky_urlopen)
+    monkeypatch.setattr("code_index.semantic.time.sleep", lambda *_: None)
+
+    emb = ApiEmbedder(api_base="https://x/v1", model="m", api_key="k", max_retries=3)
+    vecs = emb.embed(["only"])
+    assert len(vecs) == 1
+    assert calls["n"] == 3
+
+
+def test_api_embedder_gives_up_after_retries(monkeypatch):
+    def always_fail(req, timeout=None):
+        raise urllib.error.URLError("down")
+
+    monkeypatch.setattr("urllib.request.urlopen", always_fail)
+    monkeypatch.setattr("code_index.semantic.time.sleep", lambda *_: None)
+
+    emb = ApiEmbedder(api_base="https://x/v1", model="m", api_key="k", max_retries=2)
+    with pytest.raises(urllib.error.URLError):
+        emb.embed(["x"])
+
+
 def test_api_embedder_strips_trailing_slash():
     emb = ApiEmbedder(api_base="https://example/api/v1/", model="m", api_key="k")
     assert emb._url == "https://example/api/v1/embeddings"
+
+
+def test_api_embedder_parallel_preserves_order(monkeypatch):
+    # Each input encodes its global index in the first vector component so we can
+    # assert that parallel sub-batches are reassembled in the original order.
+    def fake_urlopen(req, timeout=None):
+        body = json.loads(req.data.decode("utf-8"))
+        data = [
+            {"index": i, "embedding": [float(int(txt)), 0.0]}
+            for i, txt in enumerate(body["input"])
+        ]
+        return _FakeResp(json.dumps({"data": data}).encode("utf-8"))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    emb = ApiEmbedder(
+        api_base="https://x/v1", model="m", api_key="k", batch=4, concurrency=4
+    )
+    texts = [str(i) for i in range(20)]  # 5 sub-batches of 4
+    vecs = emb.embed(texts)
+
+    assert len(vecs) == 20
+    # First component encodes each input's GLOBAL index; getting 0,1,2,...,19
+    # back in order proves parallel sub-batches are reassembled correctly.
+    assert [v[0] for v in vecs] == [float(i) for i in range(20)]
 
 
 class _Settings:
@@ -76,3 +133,150 @@ def test_semantic_index_degrades_without_key():
     idx = SemanticIndex(_Settings())
     assert idx.available is False
     assert idx.search("anything") == []
+
+
+class _CountingEmbedder:
+    """Records how many embed() calls and how big each batch was."""
+
+    def __init__(self):
+        self.batches: list[int] = []
+
+    def embed(self, texts):
+        self.batches.append(len(texts))
+        return [[float(i), 0.0, 0.0, 0.0] for i in range(len(texts))]
+
+
+class _FakeQdrant:
+    def __init__(self):
+        self.upserts: list[int] = []  # points per upsert call
+
+    def upsert(self, collection_name, points, wait=False):
+        self.upserts.append(len(points))
+
+
+class _BatchSettings(_Settings):
+    def __init__(self, batch):
+        super().__init__()
+        self.embed_api_key = "k"  # so a real embedder COULD build (we inject one)
+        self.embed_batch = batch
+        self.search_score = 0
+
+
+def _make_index(batch, embedder, client, concurrency=1, upsert_batch=1000):
+    """Build a SemanticIndex bypassing the Qdrant/embedder construction."""
+    idx = SemanticIndex.__new__(SemanticIndex)
+    idx.collection = "test"
+    idx.available = True
+    idx._dim = 4
+    idx._batch = batch
+    idx._concurrency = concurrency
+    idx._flush_at = batch * concurrency
+    idx._upsert_batch = upsert_batch
+    idx._score = 0.0
+    idx._buf = []
+    idx._pending_delete = set()
+    idx._delete_before_upsert = False  # behave like a full run (no deletes)
+    idx._embedder = embedder
+    idx._client = client
+    idx.upsert_failures = 0
+    idx.last_error = None
+    return idx
+
+
+def test_add_chunks_batches_across_files():
+    emb = _CountingEmbedder()
+    client = _FakeQdrant()
+    # concurrency=1 so flush_at == batch (64): isolates the buffering behavior.
+    idx = _make_index(batch=64, embedder=emb, client=client, concurrency=1)
+
+    # 100 single-chunk files -> should NOT make 100 embed calls.
+    for n in range(100):
+        idx.add_chunks(f"f{n}.py", [(1, 10, f"content {n}")])
+    idx.flush()
+
+    # 100 chunks, batch 64 -> auto-flush at 64, then 36 left flushed at the end.
+    # _CountingEmbedder.embed gets the whole buffer at once each flush.
+    assert emb.batches == [64, 36]
+    assert client.upserts == [64, 36]
+
+
+def test_flush_is_noop_when_empty():
+    emb = _CountingEmbedder()
+    client = _FakeQdrant()
+    idx = _make_index(batch=64, embedder=emb, client=client)
+    idx.flush()
+    assert emb.batches == []
+    assert client.upserts == []
+
+
+def test_flush_upserts_in_subbatches():
+    # 200 chunks embedded in one go, but upserted in sub-batches of 64 so a
+    # high-dim payload never becomes one huge (droppable) request body.
+    emb = _CountingEmbedder()
+    client = _FakeQdrant()
+    idx = _make_index(batch=1000, embedder=emb, client=client, upsert_batch=64)
+    for n in range(200):
+        idx.add_chunks(f"f{n}.py", [(1, 10, f"c{n}")])
+    idx.flush()
+    # One embed call (buffer < flush_at), but upserts split 64/64/64/8.
+    assert emb.batches == [200]
+    assert client.upserts == [64, 64, 64, 8]
+    assert idx.upsert_failures == 0
+
+
+def test_flush_counts_upsert_failures_without_raising():
+    class _FailingQdrant:
+        def upsert(self, collection_name, points, wait=False):
+            raise RuntimeError("WinError 10053")
+
+    emb = _CountingEmbedder()
+    idx = _make_index(batch=1000, embedder=emb, client=_FailingQdrant(), upsert_batch=64)
+    for n in range(100):
+        idx.add_chunks(f"f{n}.py", [(1, 10, f"c{n}")])
+    idx.flush()  # must not raise
+    assert idx.upsert_failures == 100
+    assert idx.last_error and "WinError 10053" in idx.last_error
+
+
+class _Pt:
+    def __init__(self, path, score):
+        self.score = score
+        self.payload = {"path": path, "start_line": 1, "end_line": 10, "preview": path}
+
+
+class _QueryResp:
+    def __init__(self, points):
+        self.points = points
+
+
+class _SearchQdrant:
+    """Fake client returning a fixed result set for query_points."""
+
+    def __init__(self, points):
+        self._points = points
+
+    def query_points(self, collection_name, query, limit, with_payload=True):
+        return _QueryResp(self._points[:limit])
+
+
+def test_search_path_glob_filters_results():
+    pts = [
+        _Pt("backend/svc.py", 0.9),
+        _Pt("backend/tests/test_svc.py", 0.8),
+        _Pt("frontend/app.tsx", 0.7),
+    ]
+    idx = _make_index(batch=64, embedder=_CountingEmbedder(), client=_SearchQdrant(pts))
+
+    only_backend = idx.search("q", limit=10, path_glob=["backend/**"])
+    assert {h.path for h in only_backend} == {"backend/svc.py", "backend/tests/test_svc.py"}
+
+    no_tests = idx.search("q", limit=10, exclude_glob=["**/tests/**"])
+    assert "backend/tests/test_svc.py" not in {h.path for h in no_tests}
+    assert "backend/svc.py" in {h.path for h in no_tests}
+
+
+def test_search_no_filter_returns_all():
+    pts = [_Pt("a.py", 0.9), _Pt("b.py", 0.8)]
+    idx = _make_index(batch=64, embedder=_CountingEmbedder(), client=_SearchQdrant(pts))
+    hits = idx.search("q", limit=10)
+    assert {h.path for h in hits} == {"a.py", "b.py"}

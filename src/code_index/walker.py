@@ -131,6 +131,59 @@ class IgnoreSpec:
         return False
 
 
+class PathFilter:
+    """Include/exclude glob filter over POSIX-relative paths (search results).
+
+    Reuses IgnoreSpec's matcher so glob semantics are identical everywhere:
+      - include: if any include glob is given, a path must match at least one.
+      - exclude: a path matching any exclude glob is dropped.
+    Empty/None on both sides => matches everything (a no-op filter).
+    """
+
+    __slots__ = ("_inc", "_exc")
+
+    def __init__(self, include: list[str] | None = None, exclude: list[str] | None = None) -> None:
+        self._inc = IgnoreSpec(include) if include else None
+        self._exc = IgnoreSpec(exclude) if exclude else None
+
+    def __bool__(self) -> bool:
+        return self._inc is not None or self._exc is not None
+
+    def match(self, relposix: str) -> bool:
+        if self._inc is not None and not self._inc.match(relposix):
+            return False
+        if self._exc is not None and self._exc.match(relposix):
+            return False
+        return True
+
+
+def read_span(root: Path, relpath: str, start: int, end: int, context: int = 0) -> str | None:
+    """Read lines [start, end] (1-based, inclusive) of a repo file, +/- context.
+
+    Returns the slice as text, or None if the file can't be read. `relpath` is
+    confined to `root` (path-traversal guard) so the tool can't read outside the
+    indexed repo.
+    """
+    root = root.resolve()
+    target = (root / relpath).resolve()
+    try:
+        target.relative_to(root)  # guard: stay inside the repo
+    except ValueError:
+        return None
+    text = read_text(target)
+    if text is None:
+        return None
+    lines = text.splitlines()
+    n = len(lines)
+    if n == 0:
+        return ""
+    lo = max(1, start - max(0, context))
+    hi = min(n, end + max(0, context))
+    if lo > n:
+        return ""
+    return "\n".join(lines[lo - 1 : hi])
+
+
 def read_gitignore(root: Path) -> list[str]:
     """Read the repo-root .gitignore into a list of raw patterns (best effort).
 

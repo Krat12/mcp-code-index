@@ -10,6 +10,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from .walker import PathFilter
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -139,31 +141,91 @@ class Store:
 
     # ---- querying ---------------------------------------------------------
 
-    def search_text(self, query: str, limit: int = 30) -> list[TextHit]:
-        rows = self.conn.execute(
-            "SELECT path, line, content FROM lines_fts WHERE lines_fts MATCH ? "
-            "ORDER BY rank LIMIT ?",
-            (query, limit),
-        ).fetchall()
-        return [TextHit(r["path"], r["line"], r["content"]) for r in rows]
+    def _fts_query(self, query: str, limit: int) -> list[sqlite3.Row]:
+        """Run an FTS5 MATCH, falling back to a safe phrase query on syntax errors.
 
-    def search_symbol(self, name: str, limit: int = 30, exact: bool = False) -> list[SymbolHit]:
+        Agents/users may pass raw text with unbalanced quotes/parens or dangling
+        operators, which FTS5 rejects with OperationalError. Rather than surface
+        a crash, retry the whole input as a single quoted phrase (every char but
+        the embedded double-quotes is literal inside an FTS5 string).
+        """
+        sql = (
+            "SELECT path, line, content FROM lines_fts WHERE lines_fts MATCH ? "
+            "ORDER BY rank LIMIT ?"
+        )
+        try:
+            return self.conn.execute(sql, (query, limit)).fetchall()
+        except sqlite3.OperationalError:
+            phrase = '"' + query.replace('"', " ") + '"'
+            try:
+                return self.conn.execute(sql, (phrase, limit)).fetchall()
+            except sqlite3.OperationalError:
+                return []
+
+    def search_text(
+        self,
+        query: str,
+        limit: int = 30,
+        path_glob: list[str] | None = None,
+        exclude_glob: list[str] | None = None,
+    ) -> list[TextHit]:
+        pf = PathFilter(path_glob, exclude_glob)
+        # Over-fetch when filtering so post-filtering still fills `limit`.
+        fetch = limit * 8 if pf else limit
+        rows = self._fts_query(query, fetch)
+        hits: list[TextHit] = []
+        for r in rows:
+            if pf and not pf.match(r["path"]):
+                continue
+            hits.append(TextHit(r["path"], r["line"], r["content"]))
+            if len(hits) >= limit:
+                break
+        return hits
+
+    def search_symbol(
+        self,
+        name: str,
+        limit: int = 30,
+        exact: bool = False,
+        path_glob: list[str] | None = None,
+        exclude_glob: list[str] | None = None,
+    ) -> list[SymbolHit]:
+        pf = PathFilter(path_glob, exclude_glob)
+        fetch = limit * 8 if pf else limit
         if exact:
             rows = self.conn.execute(
                 "SELECT path, name, kind, start_line, end_line FROM symbols "
                 "WHERE name = ? LIMIT ?",
-                (name, limit),
+                (name, fetch),
             ).fetchall()
         else:
             rows = self.conn.execute(
                 "SELECT path, name, kind, start_line, end_line FROM symbols "
                 "WHERE name LIKE ? ORDER BY length(name) LIMIT ?",
-                (f"%{name}%", limit),
+                (f"%{name}%", fetch),
             ).fetchall()
-        return [
-            SymbolHit(r["path"], r["name"], r["kind"], r["start_line"], r["end_line"])
-            for r in rows
-        ]
+        hits: list[SymbolHit] = []
+        for r in rows:
+            if pf and not pf.match(r["path"]):
+                continue
+            hits.append(SymbolHit(r["path"], r["name"], r["kind"], r["start_line"], r["end_line"]))
+            if len(hits) >= limit:
+                break
+        return hits
+
+    def get_lines(self, path: str, start: int, end: int) -> list[TextHit]:
+        """Return stored lines [start, end] (1-based, inclusive) for a path.
+
+        Reads from the FTS index itself, so it works even if the file changed or
+        vanished on disk since indexing. `walker.read_span` is the live-disk
+        counterpart used by the server when it wants current file contents.
+        """
+        rows = self.conn.execute(
+            "SELECT path, line, content FROM lines_fts "
+            "WHERE path = ? AND line BETWEEN ? AND ? ORDER BY line",
+            (path, start, end),
+        ).fetchall()
+        return [TextHit(r["path"], r["line"], r["content"]) for r in rows]
 
     def file_symbols(self, path: str) -> list[SymbolHit]:
         rows = self.conn.execute(

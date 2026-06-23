@@ -169,9 +169,19 @@ for OpenCode):
 > or `["python", "-m", "code_index.server"]` with the venv's python.
 
 Restart the CLI. The agent now sees tools:
-`search_text`, `search_symbol`, `file_symbols`, `search_semantic`,
+`search_text`, `search_symbol`, `file_symbols`, `read_span`, `search_semantic`,
 `search_hybrid`, `list_services`, `reindex`, `index_stats`. Every search tool
 takes an optional `service` (name or id from `list_services`).
+
+- `read_span(path, start_line, end_line, context=0, service=...)` returns the
+  actual source at a location — the natural follow-up to a search hit, so the
+  agent can read code without a separate file tool (path is confined to the
+  repo; falls back to the index if the file changed/vanished on disk).
+- `search_text`/`search_symbol`/`search_semantic`/`search_hybrid` accept
+  `path_glob` and `exclude_glob` (globs, comma-separated or a list) to narrow
+  results by repo-relative path, e.g. `path_glob="backend/**"`,
+  `exclude_glob="**/tests/**"`. `search_text` also degrades gracefully on
+  malformed FTS5 input (it retries the query as a literal phrase).
 
 ## Keeping the index fresh
 

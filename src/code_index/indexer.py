@@ -19,6 +19,8 @@ class IndexReport:
     symbols: int = 0
     semantic_files: int = 0
     semantic_enabled: bool = False
+    # Vectors that failed to upsert into Qdrant (0 = clean run).
+    semantic_failures: int = 0
 
 
 def build_index(
@@ -32,7 +34,8 @@ def build_index(
     full=True forces a complete re-index regardless of mtimes.
 
     on_progress: optional callable(done, total, current, phase) reporting live
-    progress. `phase` is one of "scanning" | "indexing" | "removing" | "done".
+    progress. `phase` is one of
+    "scanning" | "indexing" | "removing" | "embedding" | "done".
     It is best-effort (wrapped so a misbehaving reporter never breaks indexing).
     """
 
@@ -53,6 +56,9 @@ def build_index(
         semantic = SemanticIndex(settings)
         if semantic.available:
             semantic.ensure_collection()
+        if semantic.available:
+            # full -> recreate collection once; incremental -> batch-delete stale.
+            semantic.begin(full=full)
         if semantic.available:
             log(f"semantic: ON (backend={settings.embed_backend}, collection={settings.collection_name()})")
         else:
@@ -105,10 +111,10 @@ def build_index(
         report.symbols += len(syms)
 
         if semantic and semantic.available:
-            semantic.delete_path(relpath)
+            # Buffered: chunks from many files share one API request / upsert.
             chunks = list(chunk_lines(text))
-            semantic.index_chunks(relpath, chunks)
             if chunks:
+                semantic.add_chunks(relpath, chunks)
                 report.semantic_files += 1
 
         if report.indexed % 200 == 0:
@@ -119,11 +125,23 @@ def build_index(
 
     # Remove files that vanished from disk.
     _emit(total, total, "", "removing")
-    for gone in store.known_paths() - seen:
+    gone_paths = list(store.known_paths() - seen)
+    for gone in gone_paths:
         store.delete_file(gone)
-        if semantic and semantic.available:
-            semantic.delete_path(gone)
         report.removed += 1
+    if semantic and semantic.available and gone_paths:
+        semantic.delete_paths(gone_paths)
+
+    # Flush any remaining buffered embeddings (final partial batch).
+    if semantic and semantic.available:
+        _emit(total, total, "", "embedding")
+        semantic.flush()
+        report.semantic_failures = getattr(semantic, "upsert_failures", 0)
+        if report.semantic_failures:
+            log(
+                f"semantic: WARNING {report.semantic_failures} vectors failed to "
+                f"upsert (last error: {getattr(semantic, 'last_error', None)})"
+            )
 
     store.commit()
     store.close()

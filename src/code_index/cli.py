@@ -75,6 +75,7 @@ def _index_plain(settings, sid: str, name: str, full: bool) -> None:
         f"done: indexed={report.indexed} skipped={report.skipped} removed={report.removed} "
         f"symbols={report.symbols} semantic_files={report.semantic_files} "
         f"semantic={'on' if report.semantic_enabled else 'off'}"
+        + (f" semantic_failures={report.semantic_failures}" if report.semantic_failures else "")
     )
 
 

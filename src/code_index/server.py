@@ -32,6 +32,7 @@ from .indexer import build_index
 from .registry import Service, load_registry
 from .semantic import SemanticIndex
 from .store import Store
+from .walker import read_span as _read_span
 
 mcp = FastMCP("code-index")
 
@@ -84,29 +85,64 @@ def _get_semantic(service: Optional[str] = None) -> SemanticIndex | None:
         return _semantics[k]
 
 
+def _as_glob_list(value) -> list[str] | None:
+    """Accept a comma-separated string or a list of globs; normalize to a list."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.split(",") if p.strip()]
+        return parts or None
+    if isinstance(value, (list, tuple)):
+        parts = [str(v).strip() for v in value if str(v).strip()]
+        return parts or None
+    return None
+
+
 @mcp.tool()
-def search_text(query: str, limit: int = 30, service: Optional[str] = None) -> str:
+def search_text(
+    query: str,
+    limit: int = 30,
+    service: Optional[str] = None,
+    path_glob: Optional[str] = None,
+    exclude_glob: Optional[str] = None,
+) -> str:
     """Exact full-text search across a service (FTS5). Returns path:line: content.
 
     Use for known strings, identifiers, config keys, error messages. Supports
     FTS5 syntax, e.g. "foo AND bar", "exact phrase", prefix*.
     `service` selects which microservice index to search (name or id); omit for
     the default service.
+    `path_glob`/`exclude_glob` narrow results by repo-relative path (globs;
+    comma-separated or a list), e.g. path_glob="backend/**", exclude_glob="**/tests/**".
     """
-    hits = _get_store(service).search_text(query, limit=limit)
+    hits = _get_store(service).search_text(
+        query, limit=limit,
+        path_glob=_as_glob_list(path_glob), exclude_glob=_as_glob_list(exclude_glob),
+    )
     if not hits:
         return f"No text matches for: {query}"
     return "\n".join(f"{h.path}:{h.line}: {h.content.strip()}" for h in hits)
 
 
 @mcp.tool()
-def search_symbol(name: str, limit: int = 30, exact: bool = False, service: Optional[str] = None) -> str:
+def search_symbol(
+    name: str,
+    limit: int = 30,
+    exact: bool = False,
+    service: Optional[str] = None,
+    path_glob: Optional[str] = None,
+    exclude_glob: Optional[str] = None,
+) -> str:
     """Find symbol definitions (function/class/method/record/...) by name.
 
     Use to jump to where something is DEFINED. Set exact=true for an exact name
     match, otherwise substring matching is used. `service` selects the index.
+    `path_glob`/`exclude_glob` narrow results by repo-relative path (globs).
     """
-    hits = _get_store(service).search_symbol(name, limit=limit, exact=exact)
+    hits = _get_store(service).search_symbol(
+        name, limit=limit, exact=exact,
+        path_glob=_as_glob_list(path_glob), exclude_glob=_as_glob_list(exclude_glob),
+    )
     if not hits:
         return f"No symbols matching: {name}"
     return "\n".join(
@@ -124,16 +160,63 @@ def file_symbols(path: str, service: Optional[str] = None) -> str:
 
 
 @mcp.tool()
-def search_semantic(query: str, limit: int = 10, service: Optional[str] = None) -> str:
+def read_span(
+    path: str,
+    start_line: int,
+    end_line: int,
+    context: int = 0,
+    service: Optional[str] = None,
+) -> str:
+    """Read source lines [start_line, end_line] of an indexed file (1-based).
+
+    The natural follow-up to the search tools: they return `path:line` locations,
+    this returns the actual code there so you can read it without an external
+    file tool. `context` adds N lines on each side. Reads the live file on disk
+    and falls back to the stored index if the file is gone/changed. `path` must
+    be a repo-relative path from a search result (it is confined to the repo).
+    """
+    if start_line < 1:
+        start_line = 1
+    if end_line < start_line:
+        end_line = start_line
+    settings = _resolve_settings(service)
+    text = _read_span(settings.root, path, start_line, end_line, context=context)
+    if text is None:
+        # File unreadable/missing on disk -> serve the indexed copy instead.
+        lo = max(1, start_line - max(0, context))
+        hi = end_line + max(0, context)
+        rows = _get_store(service).get_lines(path, lo, hi)
+        if not rows:
+            return f"Could not read {path}:{start_line}-{end_line} (not on disk or in index)."
+        body = "\n".join(r.content for r in rows)
+        return f"{path}:{lo}-{hi} (from index)\n{body}"
+    if text == "":
+        return f"{path}:{start_line}-{end_line} is empty or out of range."
+    lo = max(1, start_line - max(0, context))
+    return f"{path}:{lo}-{end_line + max(0, context)}\n{text}"
+
+
+@mcp.tool()
+def search_semantic(
+    query: str,
+    limit: int = 10,
+    service: Optional[str] = None,
+    path_glob: Optional[str] = None,
+    exclude_glob: Optional[str] = None,
+) -> str:
     """Fuzzy meaning-based search (vector similarity via Qdrant).
 
     Use for conceptual queries like "where do we validate refunds" when you
     don't know exact identifiers. `service` selects the index.
+    `path_glob`/`exclude_glob` narrow results by repo-relative path (globs).
     """
     sem = _get_semantic(service)
     if sem is None:
         return "Semantic search is disabled (Qdrant/fastembed unavailable)."
-    hits = sem.search(query, limit=limit)
+    hits = sem.search(
+        query, limit=limit,
+        path_glob=_as_glob_list(path_glob), exclude_glob=_as_glob_list(exclude_glob),
+    )
     if not hits:
         return f"No semantic matches for: {query}"
     out = []
@@ -143,23 +226,32 @@ def search_semantic(query: str, limit: int = 10, service: Optional[str] = None) 
 
 
 @mcp.tool()
-def search_hybrid(query: str, limit: int = 8, service: Optional[str] = None) -> str:
+def search_hybrid(
+    query: str,
+    limit: int = 8,
+    service: Optional[str] = None,
+    path_glob: Optional[str] = None,
+    exclude_glob: Optional[str] = None,
+) -> str:
     """Best-effort combined search: symbols + text + semantic for one service.
 
     Prefer this when you're not sure which layer fits. `service` selects the
     index (name or id); omit for the default service.
+    `path_glob`/`exclude_glob` narrow results by repo-relative path (globs).
     """
     store = _get_store(service)
+    inc = _as_glob_list(path_glob)
+    exc = _as_glob_list(exclude_glob)
     sections: list[str] = []
 
-    syms = store.search_symbol(query, limit=limit)
+    syms = store.search_symbol(query, limit=limit, path_glob=inc, exclude_glob=exc)
     if syms:
         sections.append(
             "## Symbols\n"
             + "\n".join(f"{s.kind} {s.name} -> {s.path}:{s.start_line}" for s in syms)
         )
 
-    texts = store.search_text(query, limit=limit)
+    texts = store.search_text(query, limit=limit, path_glob=inc, exclude_glob=exc)
     if texts:
         sections.append(
             "## Text\n"
@@ -168,7 +260,7 @@ def search_hybrid(query: str, limit: int = 8, service: Optional[str] = None) -> 
 
     sem = _get_semantic(service)
     if sem is not None:
-        sem_hits = sem.search(query, limit=limit)
+        sem_hits = sem.search(query, limit=limit, path_glob=inc, exclude_glob=exc)
         if sem_hits:
             sections.append(
                 "## Semantic\n"
