@@ -266,6 +266,12 @@ tools over the built-in grep/file scan:
 - In a multi-repo setup, pass the `service` argument (see `list_services`);
   narrow with `path_glob` / `exclude_glob`.
 
+**Choosing the service:** when multiple services are registered and it isn't
+obvious which one the user means, do NOT guess — call `list_services` and **ask
+the user which service to search** (offer the names). Only skip the question
+when the target is unambiguous (e.g. a single registered service, or the user
+named the repo explicitly).
+
 **Fallback:** if `index_stats` reports the index is empty/unavailable, or a tool
 errors, fall back to the built-in search/read tools — don't get stuck. A
 "semantic disabled/unavailable" reply is a degraded state, not "no results":
