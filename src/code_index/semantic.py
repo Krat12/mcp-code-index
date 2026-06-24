@@ -312,30 +312,40 @@ class SemanticIndex:
     def delete_path(self, path: str) -> None:
         self.delete_paths([path])
 
-    def delete_paths(self, paths: list[str]) -> None:
-        """Delete all points for the given paths in ONE request."""
+    def delete_paths(self, paths: list[str], batch: int = 200) -> None:
+        """Delete all points for the given paths, in chunked requests.
+
+        A single MatchAny over thousands of paths makes one huge filter that is
+        slow for Qdrant to evaluate and a big request body; chunking keeps each
+        delete cheap (matches the batched SQLite deletion on the indexer side).
+        """
         if not self.available or not paths:
             return
         from qdrant_client import models
 
-        try:
-            # wait=True so a later (wait=False) upsert of the same deterministic
-            # point ids can never be clobbered by a delete that lands afterwards.
-            self._client.delete(
-                collection_name=self.collection,
-                points_selector=models.FilterSelector(
-                    filter=models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key="path", match=models.MatchAny(any=list(paths))
-                            )
-                        ]
-                    )
-                ),
-                wait=True,
-            )
-        except Exception:
-            pass
+        unique = list(dict.fromkeys(paths))
+        batch = max(1, int(batch))
+        for i in range(0, len(unique), batch):
+            chunk = unique[i : i + batch]
+            try:
+                # wait=True so a later (wait=False) upsert of the same
+                # deterministic point ids can never be clobbered by a delete
+                # that lands afterwards.
+                self._client.delete(
+                    collection_name=self.collection,
+                    points_selector=models.FilterSelector(
+                        filter=models.Filter(
+                            must=[
+                                models.FieldCondition(
+                                    key="path", match=models.MatchAny(any=chunk)
+                                )
+                            ]
+                        )
+                    ),
+                    wait=True,
+                )
+            except Exception:
+                pass
 
     def add_chunks(self, path: str, chunks: list[tuple[int, int, str]]) -> None:
         """Queue a file's chunks; flush automatically once the buffer is full.

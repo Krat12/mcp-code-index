@@ -63,6 +63,15 @@ stdlib status page.
 - **`store.search_text` must not crash on bad FTS5 syntax.** `_fts_query` catches
   `sqlite3.OperationalError` and retries the input as a quoted phrase — preserve
   this when touching text search.
+- **Deleting stale files MUST stay batched (`store.delete_files`), never
+  per-file in a loop.** `lines_fts.path` is an FTS5 `UNINDEXED` column (no
+  btree), so every `DELETE ... WHERE path = ?` scans the WHOLE FTS table.
+  Per-file deletion is O(files × table) and hangs for hours when a repo shrinks
+  a lot (e.g. an ignore rule cutting 19k → 5k files makes ~14k full scans). The
+  indexer deletes in chunks of 200 via `WHERE path IN (...)`, commits per chunk,
+  and emits live `removing N/total` progress; `SemanticIndex.delete_paths` is
+  likewise chunked (no single giant `MatchAny`). `delete_file` is just a
+  one-path wrapper — don't reintroduce a per-file delete loop.
 - **Semantic degradation must stay VISIBLE, never silent.** `flush()` counts
   lost chunks (`embed_failures`) / points (`upsert_failures`) instead of dropping
   them; `search()` sets `last_search_failed` so callers tell "down" from "empty";

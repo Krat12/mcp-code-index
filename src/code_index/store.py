@@ -125,9 +125,40 @@ class Store:
         return {r["path"] for r in self.conn.execute("SELECT path FROM files")}
 
     def delete_file(self, path: str) -> None:
-        self.conn.execute("DELETE FROM lines_fts WHERE path = ?", (path,))
-        self.conn.execute("DELETE FROM symbols WHERE path = ?", (path,))
-        self.conn.execute("DELETE FROM files WHERE path = ?", (path,))
+        self.delete_files((path,))
+
+    def delete_files(self, paths, batch: int = 200) -> int:
+        """Delete all rows for many paths, batched into few SQL statements.
+
+        Deleting per file is pathologically slow on a big repo: `lines_fts.path`
+        is an FTS5 UNINDEXED column (no btree index), so every
+        `DELETE ... WHERE path = ?` scans the WHOLE FTS table. Doing that once
+        per vanished file (e.g. ~14k files when an ignore rule shrinks the set)
+        is O(files x table) and can hang for hours.
+
+        Batching with `WHERE path IN (?, ?, ...)` turns it into roughly one scan
+        per `batch` files instead of one per file. We chunk the IN-list to stay
+        well under SQLite's variable limit (default 999) and to keep each
+        statement cheap. Returns the number of distinct paths requested.
+        """
+        # De-dupe + materialize once; accept any iterable.
+        unique = list(dict.fromkeys(paths))
+        if not unique:
+            return 0
+        batch = max(1, min(int(batch), 900))  # stay under SQLite's 999 var cap
+        for i in range(0, len(unique), batch):
+            chunk = unique[i : i + batch]
+            placeholders = ",".join("?" * len(chunk))
+            self.conn.execute(
+                f"DELETE FROM lines_fts WHERE path IN ({placeholders})", chunk
+            )
+            self.conn.execute(
+                f"DELETE FROM symbols WHERE path IN ({placeholders})", chunk
+            )
+            self.conn.execute(
+                f"DELETE FROM files WHERE path IN ({placeholders})", chunk
+            )
+        return len(unique)
 
     def upsert_file(
         self,

@@ -79,6 +79,44 @@ def test_delete_file_removes_everything(tmp_path):
     s.close()
 
 
+def test_delete_files_batches_and_dedupes(tmp_path):
+    s = _store(tmp_path)
+    # More files than one batch so the IN-chunking path is exercised.
+    n = 450
+    for i in range(n):
+        s.upsert_file(f"f{i}.java", 1.0, 5, "java", f"token{i} body\n",
+                      [Symbol(f"Sym{i}", "class", 1, 1)])
+    s.commit()
+    assert s.stats()["files"] == n
+
+    # Delete most of them in a single batched call (with a duplicate + an
+    # unknown path mixed in, which must be tolerated).
+    to_delete = [f"f{i}.java" for i in range(400)]
+    to_delete += ["f0.java", "does-not-exist.java"]  # duplicate + unknown
+    deleted = s.delete_files(to_delete, batch=200)
+    s.commit()
+    assert deleted == 401  # 400 distinct files + 1 unknown, de-duped
+
+    assert s.stats()["files"] == 50  # f400..f449 remain
+    assert s.search_text("token0") == []      # deleted file's text gone
+    assert s.search_symbol("Sym0") == []       # deleted file's symbols gone
+    assert s.search_text("token449")           # survivor still searchable
+    assert "f400.java" in s.known_paths()
+    assert "f399.java" not in s.known_paths()
+    s.close()
+
+
+def test_delete_files_empty_is_noop(tmp_path):
+    s = _store(tmp_path)
+    s.upsert_file("A.java", 1.0, 5, "java", "hello\n", [])
+    s.commit()
+    assert s.delete_files([]) == 0
+    assert s.delete_files(()) == 0
+    s.commit()
+    assert "A.java" in s.known_paths()
+    s.close()
+
+
 def test_stats_counts(tmp_path):
     s = _store(tmp_path)
     s.upsert_file("A.java", 1.0, 5, "java", "a\n", [Symbol("A", "class", 1, 1)])

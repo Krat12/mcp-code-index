@@ -130,14 +130,25 @@ def build_index(
 
         _emit(i, total, relpath, "indexing")
 
-    # Remove files that vanished from disk.
-    _emit(total, total, "", "removing")
+    # Remove files that vanished from disk (or got newly excluded by an ignore
+    # rule). Batched: deleting per file is O(files x FTS table) because the FTS
+    # `path` column is UNINDEXED, so shrinking a big repo (e.g. 19k -> 5k files)
+    # used to scan the whole index ~14k times and hang for hours.
     gone_paths = list(store.known_paths() - seen)
-    for gone in gone_paths:
-        store.delete_file(gone)
-        report.removed += 1
-    if semantic and semantic.available and gone_paths:
-        semantic.delete_paths(gone_paths)
+    gone_total = len(gone_paths)
+    _emit(total, total, f"removing {gone_total} stale files", "removing")
+    if gone_paths:
+        del_batch = 200
+        done = 0
+        for i in range(0, gone_total, del_batch):
+            chunk = gone_paths[i : i + del_batch]
+            store.delete_files(chunk, batch=del_batch)
+            store.commit()  # release locks promptly; keep each step durable
+            done += len(chunk)
+            report.removed += len(chunk)
+            _emit(total, total, f"removed {done}/{gone_total} stale files", "removing")
+        if semantic and semantic.available:
+            semantic.delete_paths(gone_paths)
 
     # Flush any remaining buffered embeddings (final partial batch).
     if semantic and semantic.available:
