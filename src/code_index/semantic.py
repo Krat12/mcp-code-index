@@ -13,13 +13,50 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import platform
+import socket
+import sys
 import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Protocol
+from urllib.parse import urlparse
+
+# qdrant_client pulls in fastembed -> onnxruntime, which calls platform.uname()
+# at import time. On Windows boxes with a broken WMI provider that call hangs
+# forever, deadlocking the first `import qdrant_client`. Pre-seed the uname cache
+# from env-only values (node()/release()/version() would recurse back into the
+# same WMI query) so the probe is never issued. Harmless when WMI works.
+if sys.platform == "win32" and getattr(platform, "_uname_cache", None) is None:
+    platform._uname_cache = platform.uname_result(
+        "Windows",
+        os.environ.get("COMPUTERNAME", "host"),
+        "10",  # release: satisfy onnxruntime's ">= Windows 10" version check
+        "",
+        os.environ.get("PROCESSOR_ARCHITECTURE", ""),
+    )
+
+
+def _port_is_open(url: str, timeout: float = 1.0) -> bool:
+    """True if a TCP connection to the URL's host:port succeeds quickly.
+
+    Used to tell "Docker is up but Qdrant is still warming up" (port open, API
+    not ready yet) from "Qdrant isn't there at all" (connection refused). A
+    cheap stdlib check; never raises.
+    """
+    try:
+        parsed = urlparse(url if "://" in url else f"http://{url}")
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (443 if parsed.scheme == "https" else 6333)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 
 @dataclass
@@ -61,6 +98,9 @@ class ApiEmbedder:
         timeout: float = 60.0,
         max_retries: int = 3,
         concurrency: int = 6,
+        search_timeout: float | None = None,
+        search_retries: int = 0,
+        query_cache: int = 0,
     ) -> None:
         if not api_key:
             raise RuntimeError("CODE_INDEX_EMBED_API_KEY is not set for the api embed backend")
@@ -71,8 +111,15 @@ class ApiEmbedder:
         self._timeout = timeout
         self._max_retries = max(0, max_retries)
         self._concurrency = max(1, concurrency)
+        # Search path: a short budget + (by default) zero retries so a slow
+        # provider degrades fast instead of hanging the interactive MCP tool.
+        self._search_timeout = float(search_timeout) if search_timeout else timeout
+        self._search_retries = max(0, search_retries)
+        # Tiny in-memory LRU so repeated identical queries skip the API.
+        self._query_cache_size = max(0, query_cache)
+        self._query_cache: OrderedDict[str, list[float]] = OrderedDict()
 
-    def _post_once(self, inputs: list[str]) -> list[list[float]]:
+    def _post_once(self, inputs: list[str], timeout: float | None = None) -> list[list[float]]:
         payload = json.dumps({"model": self._model, "input": inputs}).encode("utf-8")
         req = urllib.request.Request(
             self._url,
@@ -83,7 +130,7 @@ class ApiEmbedder:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or self._timeout) as resp:
             raw = resp.read()
         return self._parse_response(raw, expected=len(inputs))
 
@@ -170,6 +217,36 @@ class ApiEmbedder:
             out.extend(r)
         return out
 
+    def embed_query(self, text: str) -> list[float]:
+        """Embed ONE search query with the short search budget and no retries.
+
+        Separate from `embed` (the indexing path) so interactive search never
+        inherits the long indexing timeout/retries. An LRU cache short-circuits
+        repeated identical queries. Raises on timeout/error so the caller marks
+        the search degraded rather than silently empty.
+        """
+        if self._query_cache_size and text in self._query_cache:
+            self._query_cache.move_to_end(text)
+            return self._query_cache[text]
+        vec: list[float] | None = None
+        last: Exception | None = None
+        for attempt in range(self._search_retries + 1):
+            try:
+                vec = self._post_once([text], timeout=self._search_timeout)[0]
+                break
+            except Exception as exc:
+                last = exc
+                if attempt < self._search_retries:
+                    time.sleep(min(2.0, 0.5 * (2 ** attempt)))
+        if vec is None:
+            raise last if last is not None else RuntimeError("query embedding failed")
+        if self._query_cache_size:
+            self._query_cache[text] = vec
+            self._query_cache.move_to_end(text)
+            while len(self._query_cache) > self._query_cache_size:
+                self._query_cache.popitem(last=False)
+        return vec
+
 
 class FastEmbedEmbedder:
     """Local fastembed model (downloaded once, then offline)."""
@@ -193,8 +270,12 @@ def _make_embedder(settings) -> Embedder:
         model=settings.embed_api_model,
         api_key=settings.embed_api_key,
         batch=getattr(settings, "embed_batch", 64),
+        timeout=getattr(settings, "embed_timeout", 60.0),
         max_retries=getattr(settings, "embed_max_retries", 3),
         concurrency=getattr(settings, "embed_concurrency", 6),
+        search_timeout=getattr(settings, "embed_search_timeout", None),
+        search_retries=getattr(settings, "embed_search_retries", 0),
+        query_cache=getattr(settings, "embed_query_cache", 0),
     )
 
 
@@ -226,11 +307,28 @@ class SemanticIndex:
         # (incremental runs only; a full run recreates the collection instead).
         self._pending_delete: set[str] = set()
         self._delete_before_upsert: bool = True
+        self._qdrant_url = getattr(settings, "qdrant_url", "")
         try:
+            # Build the embedder first: a missing API key (or other bad config)
+            # must fail BEFORE importing qdrant_client, whose dependency chain
+            # (fastembed -> onnxruntime) calls platform.uname() and can hang on a
+            # broken WMI provider during a cold start.
+            self._embedder: Embedder = embedder or _make_embedder(settings)
             from qdrant_client import QdrantClient
 
-            self._embedder: Embedder = embedder or _make_embedder(settings)
-            self._client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+            kwargs: dict = {
+                "url": settings.qdrant_url,
+                "api_key": settings.qdrant_api_key,
+                # Skip the version-compatibility round-trip in the constructor:
+                # it does a network call that can also hang during a cold start.
+                "check_compatibility": False,
+            }
+            # Hard per-request timeout so a warming-up Qdrant fails fast instead
+            # of hanging past the MCP client's tool timeout (0 = client default).
+            timeout = getattr(settings, "qdrant_timeout", 0) or 0
+            if timeout:
+                kwargs["timeout"] = int(max(1, round(timeout)))
+            self._client = QdrantClient(**kwargs)
         except Exception:
             # Missing deps, bad config, or Qdrant unreachable -> semantic disabled.
             self.available = False
@@ -242,6 +340,16 @@ class SemanticIndex:
         if vecs and self._dim is None:
             self._dim = len(vecs[0])
         return vecs
+
+    def _embed_query(self, query: str) -> list[float]:
+        # Use the embedder's dedicated search path (short timeout, no retries,
+        # LRU cache) when available (ApiEmbedder); local embedders are fast, so
+        # the plain embed() path is fine for them.
+        eq = getattr(self._embedder, "embed_query", None)
+        vec = eq(query) if callable(eq) else self._embed([query])[0]
+        if vec and self._dim is None:
+            self._dim = len(vec)
+        return vec
 
     def ensure_collection(self) -> None:
         if not self.available:
@@ -430,24 +538,37 @@ class SemanticIndex:
     def health(self) -> dict:
         """Cheap liveness probe of the semantic backend (for status/diagnostics).
 
-        Returns {"status": "ok"|"unavailable", "collection": ..., "points": int|None,
-        "error": str|None}. Never raises. "unavailable" means the embedder/Qdrant
-        could not be reached, so semantic search will return degraded results.
+        Returns {"status": ..., "collection": ..., "points": int|None,
+        "error": str|None}. Never raises. Status is one of:
+          "ok"          - collection reachable; `points` is its size.
+          "warming_up"  - the request failed/timed out BUT the Qdrant port is
+                          open (Docker up, service still starting). Transient:
+                          retry shortly. Distinct so callers don't report a hard
+                          failure during a cold start.
+          "unavailable" - the embedder/Qdrant could not be reached at all.
         """
         if not self.available:
             return {"status": "unavailable", "collection": self.collection,
                     "points": None, "error": self.last_error or "embedder/Qdrant unavailable"}
         try:
-            if not self._client.collection_exists(self.collection):
-                return {"status": "unavailable", "collection": self.collection,
-                        "points": 0, "error": "collection does not exist yet"}
+            # One bounded call (the client carries qdrant_timeout). count() also
+            # implicitly verifies the collection exists.
             info = self._client.count(collection_name=self.collection, exact=False)
             points = getattr(info, "count", None)
             return {"status": "ok", "collection": self.collection,
                     "points": points, "error": None}
         except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            # A missing collection is a definite (not transient) answer.
+            if "doesn't exist" in str(exc).lower() or "not found" in str(exc).lower():
+                return {"status": "unavailable", "collection": self.collection,
+                        "points": 0, "error": "collection does not exist yet"}
+            # Otherwise: if the port is open, Qdrant is likely still warming up.
+            if _port_is_open(self._qdrant_url):
+                return {"status": "warming_up", "collection": self.collection,
+                        "points": None, "error": f"Qdrant not ready yet ({err})"}
             return {"status": "unavailable", "collection": self.collection,
-                    "points": None, "error": f"{type(exc).__name__}: {exc}"}
+                    "points": None, "error": err}
 
     def search(
         self,
@@ -465,7 +586,7 @@ class SemanticIndex:
         fetch = limit * 8 if pf else limit
         self.last_search_failed = False
         try:
-            vec = self._embed([query])[0]
+            vec = self._embed_query(query)
             res = self._query(vec, fetch)
         except Exception as exc:
             # Distinguish "search failed" (API/Qdrant down) from "no matches" so

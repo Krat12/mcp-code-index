@@ -3,10 +3,27 @@ never touch the real registry or caches.
 """
 
 import os
+import platform
 import sys
 from pathlib import Path
 
 import pytest
+
+# On some Windows machines the WMI provider that platform.uname() queries is
+# broken and hangs forever. onnxruntime (pulled in transitively by
+# qdrant_client -> fastembed) calls platform.uname() at import time, so a single
+# `import qdrant_client` would deadlock the whole test run. Pre-seed the uname
+# cache so the WMI query is never issued. Harmless when WMI works.
+if sys.platform == "win32" and getattr(platform, "_uname_cache", None) is None:
+    # Use only env-derived values here: platform.node()/release()/version() all
+    # route back through uname() -> the same WMI query we are trying to avoid.
+    platform._uname_cache = platform.uname_result(
+        "Windows",
+        os.environ.get("COMPUTERNAME", "host"),
+        "10",  # release: keep onnxruntime's version check happy (>= Win 10)
+        "",
+        os.environ.get("PROCESSOR_ARCHITECTURE", ""),
+    )
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:

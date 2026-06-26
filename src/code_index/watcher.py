@@ -13,6 +13,11 @@ Run it once and leave it running:
     code-index-watch                 # uses ~/.config/code-index/projects.toml
     code-index-watch --interval 600  # periodic sweep every 10 minutes
     code-index-watch --no-periodic   # rely on filesystem events only
+    code-index-watch --warm-interval 0    # disable the keep-warm embed ping
+
+A keep-warm ping (default every 120s, env CODE_INDEX_WARM_INTERVAL) embeds a
+tiny string so the remote api embedding model stays loaded and interactive
+semantic search avoids 11-21s cold starts. 0 disables it.
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ import threading
 import time
 from pathlib import Path
 
-from .config import DEFAULT_IGNORE_DIRS, DEFAULT_TEXT_EXTS
+from .config import DEFAULT_IGNORE_DIRS, DEFAULT_TEXT_EXTS, _env
 from .indexer import run_index
 from .progress import StatusFileReporter
 from .registry import Service, load_registry
@@ -83,6 +88,44 @@ def _reindex_service(service: Service, lock: threading.Lock) -> None:
             _log(f"ERROR reindexing '{service.name}': {exc!r}")
 
 
+def _keep_warm_loop(settings, interval: float, stop: threading.Event) -> None:
+    """Periodically embed a tiny string so the remote model stays loaded.
+
+    The api embedding provider (8B model) unloads after idle, turning the next
+    interactive search's query embedding into an 11-21s cold start instead of
+    ~1-2s warm. A cheap periodic ping (a few tokens) keeps the model resident so
+    `search_semantic`/`search_hybrid` stay fast. Best-effort: never raises.
+
+    Uses embed() (the indexing path), NOT embed_query(): the latter's LRU cache
+    would serve a repeated keep-warm string from memory and never hit the API,
+    so the model would still go cold. Only relevant for the api backend — a
+    local fastembed model is always resident, so there is nothing to warm.
+    """
+    backend = (getattr(settings, "embed_backend", "api") or "api").lower()
+    if backend != "api" or not getattr(settings, "semantic_enabled", True):
+        _log("keep-warm disabled (semantic off or non-api backend)")
+        return
+    from .semantic import _make_embedder
+
+    try:
+        embedder = _make_embedder(settings)
+    except Exception as exc:  # missing api key, bad config, ...
+        _log(f"keep-warm disabled (embedder init failed): {exc!r}")
+        return
+    _log(f"keep-warm enabled: pinging embed provider every {interval:.0f}s")
+    while not stop.wait(interval):
+        t = time.perf_counter()
+        try:
+            embedder.embed(["keep warm"])
+            dt = time.perf_counter() - t
+            # Only log when the ping was slow (caught a cold start) to avoid
+            # spamming the log every interval on the warm path.
+            if dt > 3.0:
+                _log(f"keep-warm ping was slow ({dt:.2f}s) - model had gone cold")
+        except Exception as exc:  # provider down/slow: stay alive, try next tick
+            _log(f"keep-warm ping failed: {exc!r}")
+
+
 def _build_handler(service: Service, debouncer: "_Debouncer"):
     from watchdog.events import FileSystemEventHandler
 
@@ -98,7 +141,13 @@ def _build_handler(service: Service, debouncer: "_Debouncer"):
     return _Handler()
 
 
-def run_watch(interval: float, debounce: float, periodic: bool, registry_path: Path | None = None) -> int:
+def run_watch(
+    interval: float,
+    debounce: float,
+    periodic: bool,
+    registry_path: Path | None = None,
+    warm_interval: float = 0.0,
+) -> int:
     from watchdog.observers import Observer
 
     services = load_registry(registry_path)
@@ -136,6 +185,17 @@ def run_watch(interval: float, debounce: float, periodic: bool, registry_path: P
         t.start()
         _log(f"periodic sweep every {interval:.0f}s enabled")
 
+    if warm_interval > 0:
+        from .config import load_settings
+
+        warm_settings = load_settings()
+        wt = threading.Thread(
+            target=_keep_warm_loop,
+            args=(warm_settings, warm_interval, stop),
+            daemon=True,
+        )
+        wt.start()
+
     try:
         while True:
             time.sleep(1)
@@ -155,8 +215,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval", type=float, default=600.0, help="periodic sweep seconds (default 600)")
     parser.add_argument("--debounce", type=float, default=3.0, help="debounce seconds after a change (default 3)")
     parser.add_argument("--no-periodic", action="store_true", help="disable the periodic sweep, FS events only")
+    parser.add_argument(
+        "--warm-interval",
+        type=float,
+        default=float(_env("CODE_INDEX_WARM_INTERVAL", "120")),
+        help="keep the api embed model warm with a tiny ping every N seconds "
+        "(default 120; 0 disables). Env: CODE_INDEX_WARM_INTERVAL.",
+    )
     args = parser.parse_args(argv)
-    return run_watch(interval=args.interval, debounce=args.debounce, periodic=not args.no_periodic)
+    return run_watch(
+        interval=args.interval,
+        debounce=args.debounce,
+        periodic=not args.no_periodic,
+        warm_interval=args.warm_interval,
+    )
 
 
 if __name__ == "__main__":

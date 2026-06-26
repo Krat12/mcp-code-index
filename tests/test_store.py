@@ -185,6 +185,13 @@ def test_busy_timeout_pragma_set(tmp_path):
     s.close()
 
 
+def test_store_accepts_custom_busy_timeout(tmp_path):
+    s = Store(tmp_path / "idx.sqlite3", busy_timeout_ms=250)
+    val = s.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert val == 250
+    s.close()
+
+
 def test_corrupt_db_raises_store_error(tmp_path):
     bad = tmp_path / "corrupt.sqlite3"
     # A file that is NOT a valid SQLite database.

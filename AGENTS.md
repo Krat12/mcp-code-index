@@ -22,6 +22,10 @@ no lint/format/typecheck config — `pytest` is the only quality gate.
 - Single test: `py -m pytest tests/test_symbols.py::test_python_symbols`
 - Console scripts (after `py -m pip install -e .`): `code-index` (CLI),
   `code-index-mcp` (MCP server, stdio), `code-index-watch` (auto-reindex daemon).
+- CLI search/read fallback exists for agents or sub-agents that do not inherit
+  the MCP session: `code-index search-text`, `search-symbol`, `read-span`,
+  `file-symbols`, `search-semantic`, `search-hybrid`, `services` (or module
+  form `py -m code_index.cli ...`). Keep this parity when adding MCP tools.
 - Progress UI: `code-index index`/`index-all` show a `rich` progress bar on a
   TTY (`--plain` to disable); `code-index status [--watch]` is a dashboard table;
   `code-index web [--port N]` is an opt-in stdlib `http.server` status page.
@@ -72,6 +76,46 @@ stdlib status page.
   and emits live `removing N/total` progress; `SemanticIndex.delete_paths` is
   likewise chunked (no single giant `MatchAny`). `delete_file` is just a
   one-path wrapper — don't reintroduce a per-file delete loop.
+- **Cold start must fail fast, never hang, and never hold the global lock.**
+  Only `search_semantic`/`search_hybrid` may build the semantic client; the
+  SQLite tools (`search_text`/`search_symbol`/`file_symbols`/`read_span`) must
+  stay instant, and `index_stats` must remain SQLite-first: it must not
+  construct `SemanticIndex`/`QdrantClient` on its hot path. It may do only a
+  tiny stdlib Qdrant count probe bounded by `CODE_INDEX_QDRANT_HEALTH_TIMEOUT`
+  (default 0.75s) after returning SQLite counts.
+  MCP read/search tools cache SQLite `Store` connections per worker thread and
+  use `CODE_INDEX_SQLITE_READ_TIMEOUT` (default 0.75s) so a concurrent
+  reindex/watcher lock becomes a visible "database is busy; retry" response
+  rather than a full MCP `Request timed out`. Indexer/writer paths keep the
+  longer Store default busy timeout.
+  MCP server diagnostics are file-only (never stdout/stderr because stdio is the
+  protocol): `~/.cache/code-index/logs/mcp.log` with rotation. Every tool logs
+  `tool_start`/`tool_finish`/`tool_error` plus `tool_slow` after
+  `CODE_INDEX_SLOW_TOOL_SECONDS` (default 2s); use this to diagnose external MCP
+  `Request timed out` errors. Tunables: `CODE_INDEX_LOG_LEVEL`,
+  `CODE_INDEX_LOG_MAX_BYTES`, `CODE_INDEX_LOG_BACKUPS`.
+  The Qdrant client is built with a hard per-request `timeout`
+  (`Settings.qdrant_timeout`, env `CODE_INDEX_QDRANT_TIMEOUT`, default 5s) and
+  `check_compatibility=False` — the REST default timeout is huge, so a
+  warming-up Qdrant (Docker up, service not ready) would otherwise hang past the
+  MCP client's tool timeout. `server._get_semantic` builds the `SemanticIndex`
+  OUTSIDE `_lock` (double-checked insert): its constructor opens a network
+  client, and holding `_lock` there would block every other tool. `health()`
+  returns `warming_up` (port open but not ready — transient) vs `unavailable`
+  (nothing there) vs `ok`; `index_stats` reports the same states from its fast
+  probe. Don't reintroduce semantic construction/network calls under `_lock`,
+  or a full-timeout Qdrant client call inside `index_stats`.
+  The FIRST semantic call also pays a one-time cost NO timeout guards:
+  `SemanticIndex.__init__` lazily does `import qdrant_client`, which pulls in
+  fastembed -> onnxruntime; on a true cold start that import alone can take ~60s
+  (observed: first `search_semantic` 65s, the next identical one 4.8s; the embed
+  HTTP call itself was fast — the time was the import, not the network). So
+  `server._prewarm_semantic()` builds the default service's `SemanticIndex` in a
+  background daemon thread at startup (`main()`), off the request path,
+  best-effort (never raises/blocks), no-op when semantic is disabled, opt-out via
+  `CODE_INDEX_PREWARM=0`. It logs `prewarm_semantic_done`/`_failed` to `mcp.log`.
+  Keep this background — don't move the heavy import onto the first request, and
+  don't make startup block on it.
 - **Semantic degradation must stay VISIBLE, never silent.** `flush()` counts
   lost chunks (`embed_failures`) / points (`upsert_failures`) instead of dropping
   them; `search()` sets `last_search_failed` so callers tell "down" from "empty";
@@ -79,6 +123,32 @@ stdlib status page.
   `search_hybrid`, `index_stats`) report disabled vs unavailable vs empty
   distinctly, and the indexer surfaces counts via `IndexReport` →
   `status.json` → `status`/web UI. Don't revert these to bare `except: return []`.
+- **The SEARCH path must never inherit the INDEXING embed timeout/retries.** The
+  api embeddings provider (qwen3-embedding-8b on routerai.ru) has bimodal
+  latency: ~1s warm but 11-21s on a cold start (the 8B model gets paged back in),
+  so embedding a query for `search_semantic`/`search_hybrid` was hanging the MCP
+  tool past the client's ~60s timeout (the old `ApiEmbedder` timeout was a
+  hardcoded 60s × up to 3 retries, and `_make_embedder` never even plumbed it
+  through). Now `ApiEmbedder.embed_query` is a SEPARATE path with its own budget
+  (`embed_search_timeout`, default 45s — 15s was cutting ~25% of real queries on
+  cold starts), ZERO retries (`embed_search_retries`),
+  and a small in-memory LRU (`embed_query_cache`); the indexing `embed()` path
+  keeps the longer `embed_timeout`/`embed_max_retries`. `SemanticIndex.search`
+  calls `_embed_query` (which prefers `embedder.embed_query` when present, else
+  falls back to `embed`) so a slow/down provider sets `last_search_failed` fast
+  and `search_hybrid` still returns its symbols+text sections. A local fallback
+  embedder is NOT an option for search: the collection is qwen-4096-dim, a local
+  model (~384-dim) lives in a different vector space and can't query it. Don't
+  reintroduce a 60s hardcoded timeout or retries on the query-embedding path.
+  The real fix for cold starts is keeping the model warm, not switching provider
+  (benchmarked: routerai vs OpenRouter default/`:nitro` on the same model are all
+  ~1-2s warm; the 11-21s spikes are idle unloads, identical across providers).
+  `watcher._keep_warm_loop` pings `embed(["keep warm"])` every
+  `CODE_INDEX_WARM_INTERVAL` seconds (default 120; 0 disables) so interactive
+  search stays on the warm path. It uses `embed()` NOT `embed_query()` on purpose
+  — the query LRU would serve a repeated string from cache and never warm the
+  remote model. Best-effort: api backend only (a local fastembed model is always
+  resident), never raises, keeps the daemon alive.
 
 - **All index state lives OUTSIDE indexed repos** (deliberate): SQLite in
   `~/.cache/code-index/<id>.sqlite3`, registry in
@@ -104,7 +174,10 @@ itself. Set `CODE_INDEX_EMBED_BACKEND=fastembed` for the local path. Env vars in
 the README table are incomplete vs `config.Settings`: also exist
 `CODE_INDEX_EMBED_BACKEND`, `CODE_INDEX_EMBED_API_BASE`, `_API_MODEL`,
 `_API_KEY`, `CODE_INDEX_EMBED_DIM`, `CODE_INDEX_DB`, `CODE_INDEX_MAX_DOC_BYTES`,
-`CODE_INDEX_IGNORE_PATHS`. If you change embedding behavior, update both files.
+`CODE_INDEX_IGNORE_PATHS`, and the embed-timeout knobs `CODE_INDEX_EMBED_TIMEOUT`
+(indexing path, default 120s), `CODE_INDEX_EMBED_SEARCH_TIMEOUT` (query path,
+default 45s), `CODE_INDEX_EMBED_SEARCH_RETRIES` (default 0), `CODE_INDEX_EMBED_QUERY_CACHE`
+(LRU size, default 256). If you change embedding behavior, update both files.
 
 ## Testing conventions
 

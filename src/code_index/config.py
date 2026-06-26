@@ -139,6 +139,7 @@ REGISTRY_PATH = CONFIG_HOME / "projects.toml"
 # Cross-process channel: whoever indexes (CLI, watcher, MCP) writes here; the
 # `status`/web UIs read here. Kept OUTSIDE every service repo like all state.
 STATUS_DIR = CACHE_HOME / "status"
+LOG_DIR = CACHE_HOME / "logs"
 
 
 def _env(name: str, default: str) -> str:
@@ -165,6 +166,39 @@ class Settings:
     db_path: Path
     qdrant_url: str = field(default_factory=lambda: _env("QDRANT_URL", "http://localhost:6333"))
     qdrant_api_key: str | None = field(default_factory=lambda: os.environ.get("QDRANT_API_KEY"))
+    # Hard cap (seconds) on every Qdrant request. The client's REST default is
+    # huge, so during a cold start (Docker up, but Qdrant still warming up) a
+    # health/search call would hang far longer than an MCP client waits for a
+    # tool, and the tool gets dropped. A short timeout turns "hang" into a fast,
+    # visible "unavailable"/"warming up". 0 = use the client default.
+    qdrant_timeout: float = field(
+        default_factory=lambda: max(0.0, float(_env("CODE_INDEX_QDRANT_TIMEOUT", "5")))
+    )
+    # Even shorter probe used by MCP status tools. `index_stats` is often called
+    # during agent startup, where even a 5s semantic timeout is too slow; keep it
+    # SQLite-first and use this tiny best-effort Qdrant probe only for the status
+    # line. 0 = skip the probe and report that semantic was not checked.
+    qdrant_health_timeout: float = field(
+        default_factory=lambda: max(0.0, float(_env("CODE_INDEX_QDRANT_HEALTH_TIMEOUT", "0.75")))
+    )
+    # MCP tools should fail fast if the index DB is locked by a concurrent
+    # reindex/watcher. The indexer still uses Store's longer writer timeout; this
+    # value is only for server-side read/search connections.
+    sqlite_read_timeout: float = field(
+        default_factory=lambda: max(0.0, float(_env("CODE_INDEX_SQLITE_READ_TIMEOUT", "0.75")))
+    )
+    # File-only MCP diagnostics. Never log to stdout/stderr: this server speaks
+    # MCP over stdio, so console noise can corrupt the protocol.
+    log_level: str = field(default_factory=lambda: _env("CODE_INDEX_LOG_LEVEL", "INFO"))
+    slow_tool_seconds: float = field(
+        default_factory=lambda: max(0.0, float(_env("CODE_INDEX_SLOW_TOOL_SECONDS", "2.0")))
+    )
+    log_max_bytes: int = field(
+        default_factory=lambda: max(1024, int(_env("CODE_INDEX_LOG_MAX_BYTES", "1048576")))
+    )
+    log_backups: int = field(
+        default_factory=lambda: max(0, int(_env("CODE_INDEX_LOG_BACKUPS", "5")))
+    )
     semantic_enabled: bool = field(
         default_factory=lambda: _env("CODE_INDEX_SEMANTIC", "1") not in ("0", "false", "no")
     )
@@ -201,6 +235,37 @@ class Settings:
     upsert_batch: int = field(default_factory=lambda: max(1, int(_env("CODE_INDEX_UPSERT_BATCH", "64"))))
     # Retries (with exponential backoff) for a failed embeddings request.
     embed_max_retries: int = field(default_factory=lambda: max(0, int(_env("CODE_INDEX_EMBED_RETRIES", "3"))))
+    # Per-request HTTP timeout for the embeddings API. Used by the INDEXER path
+    # (batch embedding), which can tolerate the slower 8B model. The background
+    # watcher is in no hurry, so this is generous (120s) to ride out any provider
+    # cold start; it is NOT infinite on purpose, so a dead-hung TCP connection
+    # eventually fails and retries instead of wedging indexing forever. Retries
+    # (embed_max_retries) still apply on top.
+    embed_timeout: float = field(
+        default_factory=lambda: max(1.0, float(_env("CODE_INDEX_EMBED_TIMEOUT", "120")))
+    )
+    # SEARCH-path budget for embedding the query. Interactive search must never
+    # hang the MCP tool: a 60s hardcoded timeout + retries made search_semantic /
+    # search_hybrid blow past the MCP client's tool timeout. With this budget and
+    # ZERO retries (embed_search_retries), a slow provider degrades to "semantic
+    # timed out" while the SQLite half of search_hybrid still returns. Measured
+    # provider latency is bimodal: ~1s warm, but 11-21s on a cold start (the 8B
+    # model gets paged back in). 15s cut ~25% of real queries; 45s covers the
+    # observed cold-start tail with margin and still stays under the ~60s MCP
+    # client tool timeout.
+    embed_search_timeout: float = field(
+        default_factory=lambda: max(1.0, float(_env("CODE_INDEX_EMBED_SEARCH_TIMEOUT", "45")))
+    )
+    # Retries for the SEARCH-path query embedding. Default 0: a retry would
+    # stack another full timeout and push past the MCP tool timeout.
+    embed_search_retries: int = field(
+        default_factory=lambda: max(0, int(_env("CODE_INDEX_EMBED_SEARCH_RETRIES", "0")))
+    )
+    # In-memory LRU cache size for query embeddings (search path). Repeated
+    # identical queries skip the API entirely. 0 disables the cache.
+    embed_query_cache: int = field(
+        default_factory=lambda: max(0, int(_env("CODE_INDEX_EMBED_QUERY_CACHE", "256")))
+    )
     # Optional minimum cosine score for semantic hits (0 = no threshold).
     search_score: float = field(default_factory=lambda: float(_env("CODE_INDEX_SEARCH_SCORE", "0")))
 

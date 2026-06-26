@@ -69,12 +69,15 @@ class StoreError(Exception):
 
 
 class Store:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, busy_timeout_ms: int = BUSY_TIMEOUT_MS) -> None:
         self.db_path = db_path
+        self.busy_timeout_ms = max(0, int(busy_timeout_ms))
         try:
             # timeout= is the Python-level busy wait; PRAGMA busy_timeout covers
             # the same at the SQLite level (belt and suspenders).
-            self.conn = sqlite3.connect(str(db_path), timeout=BUSY_TIMEOUT_MS / 1000)
+            self.conn = sqlite3.connect(
+                str(db_path), timeout=self.busy_timeout_ms / 1000, check_same_thread=False
+            )
             self.conn.row_factory = sqlite3.Row
             self._apply_pragmas()
             self.conn.executescript(SCHEMA)
@@ -103,7 +106,7 @@ class Store:
             "PRAGMA temp_store=MEMORY",
             "PRAGMA cache_size=-65536",   # ~64MB page cache
             "PRAGMA mmap_size=268435456",  # 256MB memory-mapped I/O
-            f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}",
+            f"PRAGMA busy_timeout={self.busy_timeout_ms}",
         ):
             try:
                 self.conn.execute(pragma)

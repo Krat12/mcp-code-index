@@ -170,6 +170,11 @@ def read_span(root: Path, relpath: str, start: int, end: int, context: int = 0) 
         target.relative_to(root)  # guard: stay inside the repo
     except ValueError:
         return None
+    try:
+        if target.stat().st_size > MAX_FILE_BYTES:
+            return None
+    except OSError:
+        return None
     text = read_text(target)
     if text is None:
         return None

@@ -86,6 +86,85 @@ def test_api_embedder_strips_trailing_slash():
     assert emb._url == "https://example/api/v1/embeddings"
 
 
+# --- search path: short budget, no retries, LRU cache ------------------------
+
+
+def test_embed_query_uses_search_timeout_not_index_timeout(monkeypatch):
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["timeout"] = timeout
+        body = json.loads(req.data.decode("utf-8"))
+        return _FakeResp(json.dumps(_fake_openai_response(body["input"])).encode("utf-8"))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    emb = ApiEmbedder(
+        api_base="https://x/v1", model="m", api_key="k",
+        timeout=60.0, search_timeout=15.0,
+    )
+    emb.embed_query("hello")
+    # The query path must use the short search budget, never the 60s index one.
+    assert seen["timeout"] == 15.0
+
+
+def test_embed_query_does_not_retry_by_default(monkeypatch):
+    calls = {"n": 0}
+
+    def always_fail(req, timeout=None):
+        calls["n"] += 1
+        raise urllib.error.URLError("down")
+
+    monkeypatch.setattr("urllib.request.urlopen", always_fail)
+    monkeypatch.setattr("code_index.semantic.time.sleep", lambda *_: None)
+    # search_retries defaults to 0: a slow provider must fail after ONE attempt,
+    # not stack multiple full timeouts past the MCP tool timeout.
+    emb = ApiEmbedder(api_base="https://x/v1", model="m", api_key="k", max_retries=3)
+    with pytest.raises(urllib.error.URLError):
+        emb.embed_query("q")
+    assert calls["n"] == 1
+
+
+def test_embed_query_lru_cache_skips_api(monkeypatch):
+    calls = {"n": 0}
+
+    def counting(req, timeout=None):
+        calls["n"] += 1
+        body = json.loads(req.data.decode("utf-8"))
+        return _FakeResp(json.dumps(_fake_openai_response(body["input"])).encode("utf-8"))
+
+    monkeypatch.setattr("urllib.request.urlopen", counting)
+    emb = ApiEmbedder(api_base="https://x/v1", model="m", api_key="k", query_cache=8)
+    v1 = emb.embed_query("same")
+    v2 = emb.embed_query("same")  # served from cache, no second API call
+    assert v1 == v2
+    assert calls["n"] == 1
+    emb.embed_query("other")  # different query -> one more call
+    assert calls["n"] == 2
+
+
+def test_make_embedder_plumbs_timeouts_from_settings():
+    from code_index.semantic import _make_embedder
+
+    class _S:
+        embed_backend = "api"
+        embed_api_base = "https://x/v1"
+        embed_api_model = "m"
+        embed_api_key = "k"
+        embed_batch = 32
+        embed_timeout = 30.0
+        embed_max_retries = 3
+        embed_concurrency = 4
+        embed_search_timeout = 15.0
+        embed_search_retries = 0
+        embed_query_cache = 64
+
+    emb = _make_embedder(_S())
+    assert emb._timeout == 30.0
+    assert emb._search_timeout == 15.0
+    assert emb._search_retries == 0
+    assert emb._query_cache_size == 64
+
+
 # --- response validation: HTTP 200 but garbage body --------------------------
 
 
@@ -254,6 +333,7 @@ def _make_index(batch, embedder, client, concurrency=1, upsert_batch=1000):
     idx._delete_before_upsert = False  # behave like a full run (no deletes)
     idx._embedder = embedder
     idx._client = client
+    idx._qdrant_url = "http://localhost:6333"
     idx.upsert_failures = 0
     idx.last_error = None
     return idx
@@ -355,6 +435,30 @@ def test_search_sets_last_search_failed_on_error():
     assert idx.last_search_failed is True  # degraded, distinguishable from empty
 
 
+def test_search_prefers_embed_query_when_available():
+    # When the embedder exposes embed_query (the short search path), search()
+    # must use it rather than the indexing embed() path.
+    class _DualEmbedder:
+        def __init__(self):
+            self.embed_called = False
+            self.query_called = False
+
+        def embed(self, texts):
+            self.embed_called = True
+            return [[0.0, 0.0, 0.0, 0.0] for _ in texts]
+
+        def embed_query(self, text):
+            self.query_called = True
+            return [0.1, 0.2, 0.3, 0.4]
+
+    emb = _DualEmbedder()
+    pts = [_Pt("a.py", 0.9)]
+    idx = _make_index(batch=64, embedder=emb, client=_SearchQdrant(pts))
+    idx.search("q", limit=5)
+    assert emb.query_called is True
+    assert emb.embed_called is False
+
+
 def test_health_ok_and_unavailable():
     class _OkClient:
         def collection_exists(self, name):
@@ -371,6 +475,42 @@ def test_health_ok_and_unavailable():
 
     idx.available = False
     assert idx.health()["status"] == "unavailable"
+
+
+def test_health_warming_up_when_port_open_but_count_fails(monkeypatch):
+    import code_index.semantic as sem_mod
+
+    class _SlowClient:
+        def count(self, collection_name, exact=False):
+            raise RuntimeError("timed out")
+
+    idx = _make_index(batch=64, embedder=_CountingEmbedder(), client=_SlowClient())
+    # Port "open" -> Docker up but Qdrant not ready yet -> warming_up, not a hard
+    # failure. This is the cold-start case that used to hang the tool.
+    monkeypatch.setattr(sem_mod, "_port_is_open", lambda url, timeout=1.0: True)
+    h = idx.health()
+    assert h["status"] == "warming_up"
+    assert h["points"] is None
+
+    # Port closed -> Qdrant genuinely absent -> unavailable.
+    monkeypatch.setattr(sem_mod, "_port_is_open", lambda url, timeout=1.0: False)
+    assert idx.health()["status"] == "unavailable"
+
+
+def test_health_missing_collection_is_unavailable_not_warming(monkeypatch):
+    import code_index.semantic as sem_mod
+
+    class _NoCollClient:
+        def count(self, collection_name, exact=False):
+            raise RuntimeError("Collection `test` doesn't exist!")
+
+    idx = _make_index(batch=64, embedder=_CountingEmbedder(), client=_NoCollClient())
+    # Even with the port open, a definite "no such collection" must not be
+    # mistaken for a transient warm-up.
+    monkeypatch.setattr(sem_mod, "_port_is_open", lambda url, timeout=1.0: True)
+    h = idx.health()
+    assert h["status"] == "unavailable"
+    assert h["points"] == 0
 
 
 class _Pt:
