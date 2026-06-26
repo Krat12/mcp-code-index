@@ -29,7 +29,9 @@ from .progress import (
     StatusFileReporter,
 )
 from .registry import Service, add_service, add_workspace, load_registry
+from .semantic import SemanticIndex
 from .store import Store
+from .walker import read_span as _read_span
 
 
 def _eprint(msg: str) -> None:
@@ -64,6 +66,197 @@ def _settings_and_meta(root: Path):
         if s.path.resolve() == root:
             return s.settings(), s.id, s.name
     return settings_for(root), project_id(root), root.name
+
+
+def _resolve_settings_for_cli(service: str | None = None, path: str | None = None):
+    """Resolve one service for CLI search/read commands."""
+    if service and path:
+        raise ValueError("Use either --service or --path, not both")
+    if service:
+        for s in load_registry():
+            if service in (s.id, s.name):
+                return s.settings(), s.id, s.name
+        raise ValueError(f"Unknown service '{service}'. Run `code-index list`.")
+    if path:
+        return _settings_and_meta(Path(path))
+    settings = load_settings()
+    return settings, project_id(settings.root), settings.root.name
+
+
+def _as_glob_list(value: str | None) -> list[str] | None:
+    if not value:
+        return None
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    return parts or None
+
+
+def _cmd_services() -> int:
+    services = load_registry()
+    if not services:
+        print("No services registered. Use `code-index add <path>` or `code-index add-workspace <parent>`.")
+        return 0
+    for s in services:
+        print(f"{s.name}\t(id={s.id})\t{s.path}")
+    return 0
+
+
+def _cmd_search_text(args) -> int:
+    settings, _, _ = _resolve_settings_for_cli(args.service, args.path)
+    store = Store(settings.db_path, busy_timeout_ms=int(settings.sqlite_read_timeout * 1000))
+    try:
+        hits = store.search_text(
+            args.query,
+            limit=args.limit,
+            path_glob=_as_glob_list(args.path_glob),
+            exclude_glob=_as_glob_list(args.exclude_glob),
+        )
+    finally:
+        store.close()
+    if not hits:
+        print(f"No text matches for: {args.query}")
+        return 0
+    for h in hits:
+        print(f"{h.path}:{h.line}: {h.content.strip()}")
+    return 0
+
+
+def _cmd_search_symbol(args) -> int:
+    settings, _, _ = _resolve_settings_for_cli(args.service, args.path)
+    store = Store(settings.db_path, busy_timeout_ms=int(settings.sqlite_read_timeout * 1000))
+    try:
+        hits = store.search_symbol(
+            args.name,
+            limit=args.limit,
+            exact=args.exact,
+            path_glob=_as_glob_list(args.path_glob),
+            exclude_glob=_as_glob_list(args.exclude_glob),
+        )
+    finally:
+        store.close()
+    if not hits:
+        print(f"No symbols matching: {args.name}")
+        return 0
+    for h in hits:
+        print(f"{h.kind} {h.name}  ->  {h.path}:{h.start_line}-{h.end_line}")
+    return 0
+
+
+def _cmd_file_symbols(args) -> int:
+    settings, _, _ = _resolve_settings_for_cli(args.service, args.path_root)
+    store = Store(settings.db_path, busy_timeout_ms=int(settings.sqlite_read_timeout * 1000))
+    try:
+        hits = store.file_symbols(args.file)
+    finally:
+        store.close()
+    if not hits:
+        print(f"No symbols indexed for: {args.file}")
+        return 0
+    for h in hits:
+        print(f"L{h.start_line}-{h.end_line}\t{h.kind}\t{h.name}")
+    return 0
+
+
+def _cmd_read_span(args) -> int:
+    settings, _, _ = _resolve_settings_for_cli(args.service, args.path_root)
+    start = max(1, args.start_line)
+    end = max(start, args.end_line)
+    text = _read_span(settings.root, args.file, start, end, context=args.context)
+    if text is not None:
+        if text == "":
+            print(f"{args.file}:{start}-{end} is empty or out of range.")
+        else:
+            lo = max(1, start - max(0, args.context))
+            print(f"{args.file}:{lo}-{end + max(0, args.context)}")
+            print(text)
+        return 0
+
+    lo = max(1, start - max(0, args.context))
+    hi = end + max(0, args.context)
+    store = Store(settings.db_path, busy_timeout_ms=int(settings.sqlite_read_timeout * 1000))
+    try:
+        rows = store.get_lines(args.file, lo, hi)
+    finally:
+        store.close()
+    if not rows:
+        print(f"Could not read {args.file}:{start}-{end} (not on disk or in index).")
+        return 0
+    print(f"{args.file}:{lo}-{hi} (from index)")
+    print("\n".join(r.content for r in rows))
+    return 0
+
+
+def _cmd_search_semantic(args) -> int:
+    settings, _, _ = _resolve_settings_for_cli(args.service, args.path)
+    if not settings.semantic_enabled:
+        print("Semantic search is DISABLED for this service (CODE_INDEX_SEMANTIC=0).")
+        return 0
+    sem = SemanticIndex(settings)
+    if not sem.available:
+        print("Semantic search is UNAVAILABLE (embeddings API or Qdrant could not be reached).")
+        return 0
+    hits = sem.search(
+        args.query,
+        limit=args.limit,
+        path_glob=_as_glob_list(args.path_glob),
+        exclude_glob=_as_glob_list(args.exclude_glob),
+    )
+    if getattr(sem, "last_search_failed", False):
+        print(f"Semantic search FAILED ({getattr(sem, 'last_error', 'unknown')}).")
+        return 0
+    if not hits:
+        print(f"No semantic matches for: {args.query}")
+        return 0
+    for h in hits:
+        print(f"[{h.score:.3f}] {h.path}:{h.start_line}-{h.end_line}")
+        print(h.preview)
+        print()
+    return 0
+
+
+def _cmd_search_hybrid(args) -> int:
+    settings, _, _ = _resolve_settings_for_cli(args.service, args.path)
+    inc = _as_glob_list(args.path_glob)
+    exc = _as_glob_list(args.exclude_glob)
+    store = Store(settings.db_path, busy_timeout_ms=int(settings.sqlite_read_timeout * 1000))
+    try:
+        syms = store.search_symbol(args.query, limit=args.limit, path_glob=inc, exclude_glob=exc)
+        texts = store.search_text(args.query, limit=args.limit, path_glob=inc, exclude_glob=exc)
+    finally:
+        store.close()
+
+    printed = False
+    if syms:
+        printed = True
+        print("## Symbols")
+        for s in syms:
+            print(f"{s.kind} {s.name} -> {s.path}:{s.start_line}")
+    if texts:
+        printed = True
+        print("\n## Text" if printed else "## Text")
+        for t in texts:
+            print(f"{t.path}:{t.line}: {t.content.strip()}")
+    if settings.semantic_enabled:
+        sem = SemanticIndex(settings)
+        if sem.available:
+            sem_hits = sem.search(args.query, limit=args.limit, path_glob=inc, exclude_glob=exc)
+            if sem_hits:
+                printed = True
+                print("\n## Semantic" if printed else "## Semantic")
+                for h in sem_hits:
+                    print(f"[{h.score:.3f}] {h.path}:{h.start_line}-{h.end_line}")
+        else:
+            print("\n## Semantic\n(unavailable — text+symbols above are unaffected)")
+    if not printed:
+        print(f"No matches for: {args.query}")
+    return 0
+
+
+def _add_search_common(p, default_limit: int = 30) -> None:
+    p.add_argument("--service", default=None, help="registered service name or id")
+    p.add_argument("--path", default=None, help="project root instead of a registered service")
+    p.add_argument("--limit", type=int, default=default_limit, help="max results")
+    p.add_argument("--path-glob", default=None, help="include glob(s), comma-separated")
+    p.add_argument("--exclude-glob", default=None, help="exclude glob(s), comma-separated")
 
 
 def _index_plain(settings, sid: str, name: str, full: bool) -> None:
@@ -254,6 +447,38 @@ def main(argv: list[str] | None = None) -> int:
     p_web.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
     p_web.add_argument("--port", type=int, default=8765, help="bind port (default 8765)")
 
+    sub.add_parser("services", help="list services in MCP-friendly format")
+
+    p_st = sub.add_parser("search-text", help="CLI fallback for MCP search_text")
+    p_st.add_argument("query")
+    _add_search_common(p_st)
+
+    p_ss = sub.add_parser("search-symbol", help="CLI fallback for MCP search_symbol")
+    p_ss.add_argument("name")
+    p_ss.add_argument("--exact", action="store_true", help="exact symbol name match")
+    _add_search_common(p_ss)
+
+    p_fs = sub.add_parser("file-symbols", help="CLI fallback for MCP file_symbols")
+    p_fs.add_argument("file", help="repo-relative file path")
+    p_fs.add_argument("--service", default=None, help="registered service name or id")
+    p_fs.add_argument("--path-root", default=None, help="project root instead of a registered service")
+
+    p_rs = sub.add_parser("read-span", help="CLI fallback for MCP read_span")
+    p_rs.add_argument("file", help="repo-relative file path")
+    p_rs.add_argument("start_line", type=int)
+    p_rs.add_argument("end_line", type=int)
+    p_rs.add_argument("--context", type=int, default=0)
+    p_rs.add_argument("--service", default=None, help="registered service name or id")
+    p_rs.add_argument("--path-root", default=None, help="project root instead of a registered service")
+
+    p_sem = sub.add_parser("search-semantic", help="CLI fallback for MCP search_semantic")
+    p_sem.add_argument("query")
+    _add_search_common(p_sem, default_limit=10)
+
+    p_hybrid = sub.add_parser("search-hybrid", help="CLI fallback for MCP search_hybrid")
+    p_hybrid.add_argument("query")
+    _add_search_common(p_hybrid, default_limit=8)
+
     args = parser.parse_args(argv)
 
     if args.cmd == "index":
@@ -319,6 +544,25 @@ def main(argv: list[str] | None = None) -> int:
         from .webui import serve
 
         return serve(host=args.host, port=args.port)
+
+    try:
+        if args.cmd == "services":
+            return _cmd_services()
+        if args.cmd == "search-text":
+            return _cmd_search_text(args)
+        if args.cmd == "search-symbol":
+            return _cmd_search_symbol(args)
+        if args.cmd == "file-symbols":
+            return _cmd_file_symbols(args)
+        if args.cmd == "read-span":
+            return _cmd_read_span(args)
+        if args.cmd == "search-semantic":
+            return _cmd_search_semantic(args)
+        if args.cmd == "search-hybrid":
+            return _cmd_search_hybrid(args)
+    except ValueError as exc:
+        _eprint(str(exc))
+        return 2
 
     return 1
 
