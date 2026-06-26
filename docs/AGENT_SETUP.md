@@ -112,7 +112,11 @@ covers every registered service.
 
 ## 3. Ask the user the decisions only they can make
 
-Keep it to a few concrete questions:
+These questions are REQUIRED — ask all of them before registering anything.
+Don't silently fall back to defaults; the ignore/`.gitignore` step in particular
+is easy to skip and users have been bitten by it (the index bloats with
+generated/vendored files, or a `.gitignore`d build dir gets indexed anyway).
+Ask concise questions and offer a sensible default for each, but do ask.
 
 1. **Which repositories?** Either:
    - a list of individual repo paths, or
@@ -120,16 +124,26 @@ Keep it to a few concrete questions:
 2. **Semantic search on?** Default yes (needs the key + Qdrant). If they say no,
    or there's no key/Qdrant, set `CODE_INDEX_SEMANTIC=0` and proceed with
    text + symbols only.
-3. **What should be ignored per repo?** Beyond the built-in ignores (build dirs,
-   `node_modules`, `.venv`, lock files, minified bundles), ask if a repo has:
+3. **Honor each repo's `.gitignore`? (ask explicitly — don't assume)** For each
+   repo (or for the whole workspace), ask whether to also skip everything the
+   repo's **top-level** `.gitignore` skips. Default recommendation: **yes** — it
+   keeps build output, caches, and local artifacts out of the index for free.
+   This sets `use_gitignore = true` (§4). Read-only; nothing is written to the
+   repo.
+4. **Any extra paths to ignore? (ask explicitly — don't assume)** Beyond the
+   built-in ignores (build dirs, `node_modules`, `.venv`, lock files, minified
+   bundles) and `.gitignore`, ask whether the repo has anything else worth
+   excluding to keep the index lean and relevant:
    - generated/vendored code (e.g. `**/generated/**`, `*.pb.go`, `vendor/**`),
-   - large data/asset dirs,
-   - whether to also honor the repo's top-level `.gitignore`.
-   These become `ignore = [...]` / `use_gitignore = true` in the registry — see
-   §4. Nothing is written into the repo.
+   - large data/asset/fixtures dirs,
+   - anything not useful for code search.
+   These become `ignore = [...]` in the registry (§4). Nothing is written into
+   the repo.
 
-Don't over-ask. If they say "just index everything", the built-in ignores are a
-sane default — skip the ignore questions.
+If the user explicitly says "just index everything, no extra ignores", that's a
+valid answer — record it and move on. The point is that the agent must *raise*
+the `.gitignore` and extra-ignore questions, not quietly skip them. When in
+doubt about a specific glob, propose it and let the user confirm.
 
 ---
 
@@ -265,6 +279,13 @@ tools over the built-in grep/file scan:
   instead of opening the file separately.
 - In a multi-repo setup, pass the `service` argument (see `list_services`);
   narrow with `path_glob` / `exclude_glob`.
+- **Sub-agents may not inherit the MCP session.** If you delegate work to a
+  sub-agent, either do the MCP search in the main agent and pass the relevant
+  paths/spans into the sub-agent prompt, or tell the sub-agent to use the CLI
+  fallback commands instead of MCP tools:
+  `code-index search-text`, `code-index search-symbol`, `code-index read-span`,
+  `code-index file-symbols`, `code-index search-semantic`, `code-index search-hybrid`,
+  `code-index services`. Module form also works: `py -m code_index.cli ...`.
 
 **Choosing the service:** when multiple services are registered and it isn't
 obvious which one the user means, do NOT guess — call `list_services` and **ask
@@ -273,7 +294,8 @@ when the target is unambiguous (e.g. a single registered service, or the user
 named the repo explicitly).
 
 **Fallback:** if `index_stats` reports the index is empty/unavailable, or a tool
-errors, fall back to the built-in search/read tools — don't get stuck. A
+errors, or a sub-agent has no MCP session, use the CLI fallback above; if that
+also fails, fall back to the built-in search/read tools — don't get stuck. A
 "semantic disabled/unavailable" reply is a degraded state, not "no results":
 use `search_text`/`search_symbol`, which still work.
 <!-- code-index:end -->
@@ -282,6 +304,28 @@ use `search_text`/`search_symbol`, which still work.
 Keep it short and additive; never rewrite or reorder the user's existing
 `AGENTS.md` content — just append the marked block (or replace the existing
 marked block on re-runs).
+
+### 5b. Install the `code-search` skill (for sub-agents without MCP)
+
+The §5a rule lives in agent *context*. A complementary, more discoverable option
+for OpenCode / Kilo is the bundled **`code-search` skill** at
+[`skills/code-search/SKILL.md`](../skills/code-search/SKILL.md) in this repo. It
+teaches the agent the CLI fallback (`py -m code_index.cli search-text/-symbol/
+-semantic/-hybrid/file-symbols/read-span/services`), which is exactly what
+**sub-agents that don't inherit the MCP session** need.
+
+Offer to install it (skip if the user says no — skills are optional):
+
+- **OpenCode/Kilo, global (all projects):** copy the skill folder to the user's
+  global skills dir, e.g.
+  `~/.config/opencode/skills/code-search/SKILL.md` (or the Kilo equivalent).
+- **Per-project:** copy it to `<repo>/.opencode/skills/code-search/SKILL.md`
+  **only if the repo is the user's own / untracked working copy** — the §0
+  invariant still holds: do NOT add files to a *target service* repo you're
+  merely indexing. When unsure, use the global location.
+
+Copy verbatim; don't edit the skill's frontmatter `name`/`description` (the agent
+matches the skill by them). On re-runs, overwrite the file if it already exists.
 
 ---
 
@@ -318,6 +362,9 @@ git hooks involved.
 Verify:
 - `code-index list` — services resolve as expected.
 - `code-index stats-all` — file/symbol counts are non-zero.
+- CLI fallback for sub-agents works, e.g.
+  `code-index search-text "someKnownIdentifier" --service <name>` and
+  `code-index read-span <path> <start> <end> --service <name>`.
 - For semantic: in the MCP client, `index_stats` should say
   `semantic: ok (collection=..., points=N)`. From the shell you can also check
   `GET http://localhost:6333/collections` for `code_<id>`.
@@ -392,3 +439,5 @@ When the user later says "add repo X" or sets this up on a new machine:
 - `AGENTS.md` — architecture and the invariants you must preserve when editing.
 - `README.md` — user-facing overview and the full env-var table.
 - `src/code_index/registry.py` — registry format and resolution rules.
+- `skills/code-search/SKILL.md` — the bundled OpenCode/Kilo skill that teaches
+  the CLI fallback to sub-agents without an MCP session (see §5b).

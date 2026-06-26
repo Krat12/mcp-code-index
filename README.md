@@ -22,10 +22,12 @@ coding agent (Kilo CLI / OpenCode) to set it up from the runbook:
 
 The agent reads [`docs/AGENT_SETUP.md`](docs/AGENT_SETUP.md), checks your
 environment, asks you only the few things it can't decide (which repos, your
-embeddings API key, what to ignore), wires everything up, builds the index, and
-tells you where everything lives — without writing anything into your repos. The
-rest of this README is the manual reference for those who prefer to do it by
-hand.
+embeddings API key, whether to honor each repo's `.gitignore`, what else to
+ignore), wires everything up, builds the index, optionally installs the
+[`code-search` skill](skills/code-search/SKILL.md) so sub-agents can use the CLI
+fallback, and tells you where everything lives — without writing anything into
+your repos. The rest of this README is the manual reference for those who prefer
+to do it by hand.
 
 ## Requirements
 
