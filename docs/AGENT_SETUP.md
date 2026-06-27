@@ -231,8 +231,11 @@ inheritance:
 
 After restart the agent gets these tools: `search_text`, `search_symbol`,
 `file_symbols`, `read_span`, `search_semantic`, `search_hybrid`,
-`list_services`, `reindex`, `index_stats`. Every search tool takes an optional
-`service` (name or id from `list_services`) plus `path_glob` / `exclude_glob`.
+`list_services`, `reindex`, `reindex_background`, `index_stats`. Every search
+tool takes an optional `service` (name or id from `list_services`) plus
+`path_glob` / `exclude_glob`. `reindex` blocks until done and returns counts;
+`reindex_background` returns at once (fire-and-forget) and is idempotent per
+service — use it from hooks/automation, then poll `index_stats`.
 
 ### 5a. Teach the agent to actually USE code-index (per-repo `AGENTS.md` rule)
 
@@ -327,6 +330,40 @@ Offer to install it (skip if the user says no — skills are optional):
 Copy verbatim; don't edit the skill's frontmatter `name`/`description` (the agent
 matches the skill by them). On re-runs, overwrite the file if it already exists.
 
+### 5c. (OpenCode only) Auto-reindex plugin — keep the index fresh on git ops
+
+If the user runs **OpenCode**, offer the bundled auto-reindex plugin at
+[`examples/opencode-plugin/code-index-reindex.js`](../examples/opencode-plugin/code-index-reindex.js).
+It hooks OpenCode's `tool.execute.after` event and, when the agent runs a git
+command that brings in or switches code (`pull`, `fetch`, `merge`, `rebase`,
+`checkout`/`switch`, `commit`, `reset`, `cherry-pick`, `revert`, `stash pop`,
+`clone`), fires `code-index index --background` for the worktree. That CLI
+returns at once and is **idempotent per service**, so bursts of git commands
+can't pile up overlapping indexers (a short debounce coalesces them too).
+
+**Why git ops, not file edits:** while the agent is *editing*, it has already
+done its searching, so reindexing on every edit just churns. The index needs to
+catch up when a big chunk of code appears or the tree is swapped out from under
+it — `git checkout`/`switch`/`pull` etc. (This is a complement, not a
+replacement, for `code-index-watch` from §6 — use either or both.)
+
+**§0 invariant holds:** the plugin lives in the user's **OpenCode config**, never
+inside an indexed repo. Install by copying the file verbatim to one of:
+
+- **Global (all projects):** `~/.config/opencode/plugin/code-index-reindex.js`
+- **Per project (the user's own working copy, not a target service repo):**
+  `<project>/.opencode/plugin/code-index-reindex.js`
+
+Then tell the user to **restart OpenCode**. It needs `code-index` on `PATH`; if
+it isn't, set `CODE_INDEX_CLI` in the environment to the module form, e.g.
+`py -m code_index.cli` (Windows) or `python3 -m code_index.cli`. Other optional
+env knobs: `CODE_INDEX_REINDEX_DEBOUNCE_MS` (default 4000),
+`CODE_INDEX_REINDEX_PATH` (default the worktree), `CODE_INDEX_REINDEX_OFF=1` to
+disable. See `examples/opencode-plugin/README.md` for the full table.
+
+This is optional; skip it for non-OpenCode clients (Kilo CLI has no equivalent
+plugin API — fall back to `code-index-watch` in §6).
+
 ---
 
 ## 6. Build the first index
@@ -354,6 +391,10 @@ code-index-watch --interval 300
 
 Leave it running (e.g. as a startup task). It re-indexes only what changes. No
 git hooks involved.
+
+For **OpenCode** users, the §5c auto-reindex plugin is an alternative that needs
+no separate daemon — it refreshes the index off the agent's own git activity.
+Use the watcher, the plugin, or both (they're idempotent per service).
 
 ---
 
@@ -441,3 +482,5 @@ When the user later says "add repo X" or sets this up on a new machine:
 - `src/code_index/registry.py` — registry format and resolution rules.
 - `skills/code-search/SKILL.md` — the bundled OpenCode/Kilo skill that teaches
   the CLI fallback to sub-agents without an MCP session (see §5b).
+- `examples/opencode-plugin/` — the optional OpenCode auto-reindex plugin and its
+  README (see §5c); refreshes the index on the agent's git operations.
