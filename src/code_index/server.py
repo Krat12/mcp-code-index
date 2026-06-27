@@ -7,7 +7,8 @@ Tools:
     search_semantic - fuzzy meaning search via Qdrant (if enabled)
     search_hybrid   - merge text + symbol + semantic, deduped & ranked
     list_services   - show indexable services (from the external registry)
-    reindex         - rebuild the index on demand
+    reindex         - rebuild the index on demand (blocks until done)
+    reindex_background - start a reindex and return at once (fire-and-forget)
     index_stats     - counts
 
 Multi-service (microservices):
@@ -39,7 +40,8 @@ from uuid import uuid4
 from mcp.server.fastmcp import FastMCP
 
 from .config import LOG_DIR, Settings, load_settings
-from .indexer import build_index
+from .indexer import build_index, is_reindex_active, start_background_reindex
+from .progress import read_status
 from .registry import Service, load_registry
 from .semantic import SemanticIndex, _port_is_open
 from .store import Store
@@ -193,6 +195,22 @@ def _resolve_settings(service: str | None) -> Settings:
 
 def _key(settings: Settings) -> str:
     return str(settings.db_path)
+
+
+def _service_identity(service: str | None) -> tuple[str, str]:
+    """Resolve an optional service arg to its (id, display name).
+
+    Mirrors `_resolve_settings`: None -> the default (CWD) service. The id keys
+    the status file and the in-flight job guard; the name is for display.
+    """
+    if service:
+        for s in load_registry():
+            if service in (s.id, s.name):
+                return s.id, s.name
+        raise ValueError(f"Unknown service '{service}'. Use list_services to see options.")
+    from .config import project_id
+    root = _default_settings.root
+    return project_id(root), root.name
 
 
 def _get_store(service: Optional[str] = None) -> Store:
@@ -589,6 +607,50 @@ def reindex(full: bool = False, service: Optional[str] = None) -> str:
         f"indexed={report.indexed} skipped={report.skipped} removed={report.removed} "
         f"symbols={report.symbols} semantic_files={report.semantic_files} "
         f"semantic={'on' if report.semantic_enabled else 'off'}"
+    )
+
+
+@mcp.tool()
+@_trace_tool("reindex_background", ("full",))
+def reindex_background(full: bool = False, service: Optional[str] = None) -> str:
+    """Start a reindex in the background and return immediately (don't wait).
+
+    Fire-and-forget: kicks off an incremental (or full=true) rebuild in a daemon
+    thread and returns at once, so a git commit/push hook or an agent never
+    blocks on indexing. Poll `index_stats` (or the `status` CLI / web UI) to see
+    progress; the result reflects in search a few seconds later.
+
+    Idempotent per service: if a reindex is already running for this service
+    (this server's own background job, a `code-index-watch` daemon, or a CLI
+    `reindex --background` in another process), it does NOT start a second one
+    and reports the current phase instead. Use plain `reindex` if you need to
+    wait for completion and get the final counts.
+    """
+    settings = _resolve_settings(service)
+    sid, name = _service_identity(service)
+    phase = (read_status(sid) or {}).get("phase")
+
+    # Drop cached read connections so the next search reopens after the writer.
+    k = _key(settings)
+    with _lock:
+        stale = [store_key for store_key in _stores if store_key[0] == k]
+        for store_key in stale:
+            st = _stores.pop(store_key, None)
+            if st is not None:
+                st.close()
+
+    started, reason = start_background_reindex(
+        sid, name, settings, full=full, status_phase=phase,
+        thread_factory=_thread_factory,
+    )
+    if started:
+        return (
+            f"reindex started in background (service={name}, full={full}). "
+            f"Poll index_stats for progress; results land in search shortly."
+        )
+    return (
+        f"reindex already running (service={name}, phase={phase or 'unknown'}); "
+        f"not starting a second one. Poll index_stats for progress."
     )
 
 

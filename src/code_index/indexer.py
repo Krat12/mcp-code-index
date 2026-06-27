@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import dataclass
 
 from .config import Settings
@@ -217,3 +218,73 @@ def run_index(settings: Settings, full: bool = False, reporter=None, log=lambda 
         except Exception:
             pass
     return report
+
+
+# ---------------------------------------------------------------------------
+# Background (fire-and-forget) reindex, shared by the MCP server, CLI and webui.
+# ---------------------------------------------------------------------------
+
+# In-flight background jobs keyed by service id. Prevents this process from
+# launching a second indexer for the same service while one is running.
+_bg_jobs: dict[str, threading.Thread] = {}
+_bg_jobs_lock = threading.Lock()
+
+# Phases written by StatusFileReporter that mean an indexer is actively working.
+_ACTIVE_PHASES = ("scanning", "indexing", "removing")
+
+
+def _job_alive_locked(service_id: str) -> bool:
+    """Caller must hold `_bg_jobs_lock`."""
+    t = _bg_jobs.get(service_id)
+    return t is not None and t.is_alive()
+
+
+def background_job_alive(service_id: str) -> bool:
+    """True if THIS process has a background reindex thread alive for the id."""
+    with _bg_jobs_lock:
+        return _job_alive_locked(service_id)
+
+
+def is_reindex_active(service_id: str, phase: str | None) -> bool:
+    """Busy if our own thread is alive OR a status file reports an active phase.
+
+    The phase check also catches a `code-index-watch` daemon or a CLI
+    `reindex --background` from another process indexing the same service.
+    """
+    return background_job_alive(service_id) or (phase in _ACTIVE_PHASES)
+
+
+def start_background_reindex(
+    service_id: str,
+    name: str,
+    settings: Settings,
+    full: bool = False,
+    status_phase: str | None = None,
+    thread_factory=threading.Thread,
+) -> tuple[bool, str]:
+    """Start an incremental/full reindex in a daemon thread (idempotent per id).
+
+    Returns (started, reason). Not started when a reindex is already active for
+    this service — either our own background thread or another process's run
+    visible via `status_phase` (the current phase from `read_status`). The job
+    drives a `StatusFileReporter` so progress is observable via `status` /
+    `index_stats` while the caller returns immediately.
+    """
+    from .progress import StatusFileReporter  # local import: avoid cycle
+
+    with _bg_jobs_lock:
+        if _job_alive_locked(service_id) or (status_phase in _ACTIVE_PHASES):
+            return False, "already running"
+
+        def _run() -> None:
+            try:
+                reporter = StatusFileReporter(service_id, name, str(settings.root))
+                run_index(settings, full=full, reporter=reporter)
+            except Exception:
+                # The reporter already recorded the error into the status file.
+                pass
+
+        thread = thread_factory(target=_run, daemon=True)
+        _bg_jobs[service_id] = thread
+        thread.start()
+    return True, "started"

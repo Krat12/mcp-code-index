@@ -27,6 +27,7 @@ class _FakeSettings:
     def __init__(self, semantic_enabled):
         self.semantic_enabled = semantic_enabled
         self.root = config.Path(".").resolve()
+        self.db_path = config.Path(".").resolve() / "fake.sqlite3"
         self.qdrant_url = "http://localhost:6333"
         self.qdrant_api_key = None
         self.qdrant_health_timeout = 0.75
@@ -303,3 +304,39 @@ def test_tool_tracing_emits_slow_event(server, monkeypatch):
     server._run_tool("slow_test", None, {}, lambda: None)
 
     assert any("tool_slow" in e for e in events)
+
+
+def test_reindex_background_starts_and_returns_at_once(server, monkeypatch):
+    monkeypatch.setattr(server, "_resolve_settings", lambda svc: _FakeSettings(semantic_enabled=False))
+    monkeypatch.setattr(server, "_service_identity", lambda svc: ("svc_id", "svc"))
+    monkeypatch.setattr(server, "read_status", lambda sid: None)
+
+    calls = {}
+
+    def fake_start(sid, name, settings, full=False, status_phase=None, thread_factory=None):
+        calls.update(sid=sid, name=name, full=full, status_phase=status_phase)
+        return True, "started"
+
+    monkeypatch.setattr(server, "start_background_reindex", fake_start)
+
+    out = server.reindex_background(full=True)
+    assert "started in background" in out
+    assert calls["sid"] == "svc_id"
+    assert calls["full"] is True
+    # No active phase was reported, so it must be passed through as None.
+    assert calls["status_phase"] is None
+
+
+def test_reindex_background_idempotent_when_already_running(server, monkeypatch):
+    monkeypatch.setattr(server, "_resolve_settings", lambda svc: _FakeSettings(semantic_enabled=False))
+    monkeypatch.setattr(server, "_service_identity", lambda svc: ("svc_id", "svc"))
+    monkeypatch.setattr(server, "read_status", lambda sid: {"phase": "indexing"})
+    monkeypatch.setattr(
+        server,
+        "start_background_reindex",
+        lambda *a, **k: (False, "already running"),
+    )
+
+    out = server.reindex_background()
+    assert "already running" in out
+    assert "indexing" in out

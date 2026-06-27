@@ -29,6 +29,10 @@ no lint/format/typecheck config — `pytest` is the only quality gate.
 - Progress UI: `code-index index`/`index-all` show a `rich` progress bar on a
   TTY (`--plain` to disable); `code-index status [--watch]` is a dashboard table;
   `code-index web [--port N]` is an opt-in stdlib `http.server` status page.
+- Background reindex (for git commit/push hooks, fire-and-forget): MCP tool
+  `reindex_background` + CLI `code-index index --background`. Both return at once
+  and are idempotent per service (won't start a 2nd run if one is already
+  active). Poll `index_stats` / `code-index status` for progress.
 
 ## Architecture (read before editing)
 
@@ -76,6 +80,22 @@ stdlib status page.
   and emits live `removing N/total` progress; `SemanticIndex.delete_paths` is
   likewise chunked (no single giant `MatchAny`). `delete_file` is just a
   one-path wrapper — don't reintroduce a per-file delete loop.
+- **Background reindex has ONE shared helper; the job guard is non-reentrant.**
+  `indexer.start_background_reindex(id, name, settings, full, status_phase,
+  thread_factory)` is the single fire-and-forget entry point reused by the MCP
+  `reindex_background` tool, the CLI `index --background`, and `webui.start_reindex`
+  — don't fork a second copy of the thread/job machinery. Idempotency is per
+  service id: it skips if THIS process has a live job (`_bg_jobs`) OR
+  `status_phase` (from `read_status`) is in `_ACTIVE_PHASES` (catches another
+  process's watcher/CLI run). The guard lock `_bg_jobs_lock` is a plain
+  `threading.Lock` (NOT reentrant): the busy check inside the locked section
+  must call `_job_alive_locked` directly, never `background_job_alive`/
+  `is_reindex_active` (those re-acquire the lock and deadlock). The CLI path is
+  special: a CLI process is short-lived, so `--background` does NOT use a daemon
+  thread (it would die on exit) — it spawns a fully detached child
+  (`code-index index --plain`, `start_new_session`/`DETACHED_PROCESS`) that
+  outlives the hook, after the same `read_status` idempotency check. All paths
+  drive a `StatusFileReporter`, so progress shows up in `index_stats`/`status`.
 - **Cold start must fail fast, never hang, and never hold the global lock.**
   Only `search_semantic`/`search_hybrid` may build the semantic client; the
   SQLite tools (`search_text`/`search_symbol`/`file_symbols`/`read_span`) must

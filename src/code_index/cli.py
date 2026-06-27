@@ -2,6 +2,7 @@
 
 Single project:
     code-index index [--path DIR] [--full] [--plain]   # index CWD or a dir
+    code-index index --background [--path DIR] [--full] # detach (for git hooks)
     code-index stats [--path DIR]
 
 Multi-service (microservices) via the external registry:
@@ -17,16 +18,19 @@ Multi-service (microservices) via the external registry:
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 from .config import load_settings, project_id, settings_for
-from .indexer import build_index, run_index
+from .indexer import build_index, is_reindex_active, run_index
 from .progress import (
     MultiReporter,
     NullReporter,
     RichReporter,
     StatusFileReporter,
+    read_status,
 )
 from .registry import Service, add_service, add_workspace, load_registry
 from .semantic import SemanticIndex
@@ -280,6 +284,43 @@ def _index_one(root: Path, full: bool, plain: bool) -> None:
     _index_with_rich([(settings, sid, name)], full)
 
 
+def _index_background(root: Path, full: bool) -> int:
+    """Spawn a detached child that reindexes, and return immediately.
+
+    For git commit/push hooks: a hook must not block while the index rebuilds.
+    Unlike the MCP server (a long-lived process that can hold a daemon thread),
+    a CLI invocation is short-lived, so the work runs in a fully detached child
+    process (`code-index index --plain`) that outlives this one. Idempotent per
+    service: if `status.json` shows a reindex already active, we skip spawning.
+    """
+    settings, sid, name = _settings_and_meta(root)
+    phase = (read_status(sid) or {}).get("phase")
+    if is_reindex_active(sid, phase):
+        _eprint(f"reindex already running (service={name}, phase={phase}); not starting another")
+        return 0
+
+    cmd = [sys.executable, "-m", "code_index.cli", "index", "--plain", "--path", str(settings.root)]
+    if full:
+        cmd.append("--full")
+
+    kwargs: dict = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        # Detach from the console so the child survives the hook/terminal exit.
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        )
+    else:
+        kwargs["start_new_session"] = True
+
+    subprocess.Popen(cmd, **kwargs)
+    _eprint(f"reindex started in background (service={name}, full={full}); poll `code-index status`")
+    return 0
+
+
 def _index_with_rich(targets: list[tuple], full: bool) -> None:
     """Index a list of (settings, id, name) with a live rich progress bar."""
     from rich.console import Console
@@ -420,6 +461,12 @@ def main(argv: list[str] | None = None) -> int:
     p_index.add_argument("--path", default=None, help="project root (default: CWD / CODE_INDEX_ROOT)")
     p_index.add_argument("--full", action="store_true", help="force full re-index")
     p_index.add_argument("--plain", action="store_true", help="disable the rich progress bar")
+    p_index.add_argument(
+        "--background",
+        action="store_true",
+        help="start the reindex detached and return at once (for git commit/push "
+        "hooks); idempotent per service. Poll `code-index status` for progress.",
+    )
 
     p_stats = sub.add_parser("stats", help="show index statistics for one project")
     p_stats.add_argument("--path", default=None, help="project root (default: CWD / CODE_INDEX_ROOT)")
@@ -483,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "index":
         root = Path(args.path).resolve() if args.path else load_settings().root
+        if args.background:
+            return _index_background(root, full=args.full)
         _index_one(root, full=args.full, plain=args.plain)
         return 0
 

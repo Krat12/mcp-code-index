@@ -39,3 +39,45 @@ def test_cli_search_text_unknown_service(capsys):
     assert rc == 2
     err = capsys.readouterr().err
     assert "Unknown service 'missing'" in err
+
+
+def test_cli_index_background_spawns_detached_child(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    spawned = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            spawned["cmd"] = cmd
+            spawned["kwargs"] = kwargs
+
+    monkeypatch.setattr(cli.subprocess, "Popen", _FakePopen)
+
+    rc = cli.main(["index", "--background", "--path", str(root)])
+
+    assert rc == 0
+    # The detached child must run the (blocking) index command, not loop.
+    assert "index" in spawned["cmd"]
+    assert "--background" not in spawned["cmd"]
+    assert "--plain" in spawned["cmd"]
+    err = capsys.readouterr().err
+    assert "started in background" in err
+
+
+def test_cli_index_background_skips_when_already_running(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    monkeypatch.setattr(cli, "read_status", lambda sid: {"phase": "indexing"})
+
+    def fail_popen(*a, **k):
+        raise AssertionError("must not spawn a second indexer when one is running")
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fail_popen)
+
+    rc = cli.main(["index", "--background", "--path", str(root)])
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "already running" in err

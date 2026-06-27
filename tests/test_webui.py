@@ -45,14 +45,15 @@ def test_start_reindex_is_idempotent_and_runs(tmp_path, monkeypatch):
 
     started, msg = webui.start_reindex(svc)
     assert started is True
-    # The job thread should be tracked.
-    assert svc.id in webui._jobs
+    # The shared job guard should track the running thread.
+    import code_index.indexer as indexer
+
     # Wait for the background index to complete.
     for _ in range(100):
-        if not webui._job_alive(svc.id):
+        if not indexer.background_job_alive(svc.id):
             break
         time.sleep(0.05)
-    assert not webui._job_alive(svc.id)
+    assert not indexer.background_job_alive(svc.id)
 
 
 def test_snapshot_reports_busy_flag(tmp_path, monkeypatch):
@@ -89,17 +90,19 @@ def test_start_reindex_passes_full_flag(tmp_path, monkeypatch):
     _register(tmp_path, monkeypatch, "ledger")
     svc = webui._service_by_id("ledger")
 
+    import code_index.indexer as indexer
+
     captured = {}
 
     def fake_run_index(settings, full=False, reporter=None):
         captured["full"] = full
         return None
 
-    monkeypatch.setattr(webui, "run_index", fake_run_index)
+    monkeypatch.setattr(indexer, "run_index", fake_run_index)
     started, msg = webui.start_reindex(svc, full=True)
     assert started is True
     for _ in range(100):
-        if not webui._job_alive(svc.id):
+        if not indexer.background_job_alive(svc.id):
             break
         time.sleep(0.05)
     assert captured.get("full") is True

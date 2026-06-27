@@ -19,64 +19,35 @@ its own status file there while indexing).
 from __future__ import annotations
 
 import json
-import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .indexer import run_index
-from .progress import StatusFileReporter, read_status
+from .indexer import is_reindex_active, start_background_reindex
+from .progress import read_status
 from .registry import Service, load_registry
 from .store import Store
 
 
-# Active reindex jobs started from the UI, keyed by service id. Lets us avoid
-# launching two concurrent indexers for the same service from this process.
-_jobs: dict[str, threading.Thread] = {}
-_jobs_lock = threading.Lock()
-
-# Phases that mean "an indexer is actively working on this service right now".
-_ACTIVE_PHASES = ("scanning", "indexing", "removing")
-
-
-def _job_alive(service_id: str) -> bool:
-    with _jobs_lock:
-        t = _jobs.get(service_id)
-        return t is not None and t.is_alive()
-
-
 def _is_busy(service_id: str, phase: str) -> bool:
-    """Busy if our own job is running OR a status file reports an active phase.
+    """Busy if a reindex is running for this service (our process or another).
 
     The phase check also catches a `code-index-watch` daemon (a different
     process) indexing the same service, so the button stays disabled then too.
     """
-    return _job_alive(service_id) or phase in _ACTIVE_PHASES
-
-
-def _run_job(service: Service, full: bool) -> None:
-    try:
-        settings = service.settings()
-        reporter = StatusFileReporter(service.id, service.name, str(service.path))
-        run_index(settings, full=full, reporter=reporter)
-    except Exception:
-        # The reporter already records errors into the status file.
-        pass
+    return is_reindex_active(service_id, phase)
 
 
 def start_reindex(service: Service, full: bool = False) -> tuple[bool, str]:
     """Start a reindex in a background thread (idempotent per service).
 
-    full=True forces a complete rebuild (slow; re-embeds everything). The job
-    guard prevents launching a second indexer for the same service from here.
+    full=True forces a complete rebuild (slow; re-embeds everything). Delegates
+    to the shared `start_background_reindex` helper so the job guard is the same
+    one the MCP server and CLI use.
     """
-    with _jobs_lock:
-        t = _jobs.get(service.id)
-        if t is not None and t.is_alive():
-            return False, "already running"
-        thread = threading.Thread(target=_run_job, args=(service, full), daemon=True)
-        _jobs[service.id] = thread
-        thread.start()
-    return True, "started"
+    phase = (read_status(service.id) or {}).get("phase")
+    return start_background_reindex(
+        service.id, service.name, service.settings(), full=full, status_phase=phase
+    )
 
 
 def _snapshot() -> dict:
